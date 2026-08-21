@@ -145,7 +145,7 @@ export const AppRegistryLive = AppRegistry.make(
           name: decoded.name,
           status: "active",
           updatedAt: now,
-        });
+        }).onConflictDoNothing();
         const created = yield* rowById(decoded.appId);
         if (Option.isNone(created)) {
           return yield* actorError("bootstrap", "Bootstrap application was not persisted");

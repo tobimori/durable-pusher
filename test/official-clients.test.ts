@@ -7,7 +7,7 @@ import * as Schema from "effect/Schema";
 
 const enabled = process.env.PUSHER_E2E === "1";
 const host = process.env.PUSHER_E2E_HOST ?? "127.0.0.1";
-const port = Number(process.env.PUSHER_E2E_PORT ?? "1338");
+const port = Number(process.env.PUSHER_E2E_PORT ?? "1337");
 const useTLS = process.env.PUSHER_E2E_TLS === "1";
 const appId = process.env.PUSHER_APP_ID ?? "local-app";
 const appKey = process.env.PUSHER_APP_KEY ?? "local-key";
@@ -187,11 +187,10 @@ describe("official Pusher clients", () => {
       const firstChannel = testChannel("official-room-a");
       const secondChannel = testChannel("official-room-b");
       const first = client.subscribe(firstChannel);
+      const firstSubscribed = yield* prepareEvent(first, "pusher:subscription_succeeded");
       const second = client.subscribe(secondChannel);
-      yield* Effect.all([
-        waitForEvent(first, "pusher:subscription_succeeded"),
-        waitForEvent(second, "pusher:subscription_succeeded"),
-      ]);
+      const secondSubscribed = yield* prepareEvent(second, "pusher:subscription_succeeded");
+      yield* Effect.all([firstSubscribed, secondSubscribed]);
       const firstReceived = yield* prepareEvent<{ readonly message: string }>(
         first,
         "multiplexed-event",
