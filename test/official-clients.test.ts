@@ -15,6 +15,8 @@ const appSecret = process.env.PUSHER_APP_SECRET ?? "local-secret";
 const encryptionMasterKeyBase64 =
   process.env.PUSHER_ENCRYPTION_MASTER_KEY ??
   "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+const runId = crypto.randomUUID();
+const testChannel = (name: string): string => `${name}-${runId}`;
 
 class OfficialClientError extends Schema.TaggedError<OfficialClientError>()(
   "OfficialClientError",
@@ -41,6 +43,12 @@ const waitForEvent = Effect.fn("OfficialClients.waitForEvent")(<A = unknown>(
     bindable.bind(eventName, callback);
     return Effect.sync(() => bindable.unbind(eventName, callback));
   }).pipe(Effect.timeout("15 seconds")));
+
+const realDelay = Effect.fn("OfficialClients.realDelay")((milliseconds: number) =>
+  Effect.callback<void>((resume) => {
+    const timeout = setTimeout(() => resume(Effect.void), milliseconds);
+    return Effect.sync(() => clearTimeout(timeout));
+  }));
 
 const makeServer = (encrypted = false) =>
   Effect.sync(
@@ -112,8 +120,10 @@ describe("official Pusher clients", () => {
     Effect.gen(function* () {
       const server = yield* makeServer();
       const client = yield* makeClient(server);
-      const first = client.subscribe("official-room-a");
-      const second = client.subscribe("official-room-b");
+      const firstChannel = testChannel("official-room-a");
+      const secondChannel = testChannel("official-room-b");
+      const first = client.subscribe(firstChannel);
+      const second = client.subscribe(secondChannel);
       yield* Effect.all([
         waitForEvent(first, "pusher:subscription_succeeded"),
         waitForEvent(second, "pusher:subscription_succeeded"),
@@ -124,7 +134,7 @@ describe("official Pusher clients", () => {
       ]).pipe(
         Effect.forkChild,
         Effect.tap(() =>
-          trigger(server, ["official-room-a", "official-room-b"], "multiplexed-event", {
+          trigger(server, [firstChannel, secondChannel], "multiplexed-event", {
             message: "roundtrip",
           }),
         ),
@@ -140,24 +150,24 @@ describe("official Pusher clients", () => {
       const server = yield* makeServer();
       const sender = yield* makeClient(server);
       const receiver = yield* makeClient(server);
-      const senderChannel = sender.subscribe("private-official-room");
-      const receiverChannel = receiver.subscribe("private-official-room");
+      const channel = testChannel("private-official-room");
+      const senderChannel = sender.subscribe(channel);
+      const receiverChannel = receiver.subscribe(channel);
       yield* Effect.all([
         waitForEvent(senderChannel, "pusher:subscription_succeeded"),
         waitForEvent(receiverChannel, "pusher:subscription_succeeded"),
       ]);
-      const received = yield* waitForEvent<{ readonly message: string }>(
+      const receivedFiber = yield* waitForEvent<{ readonly message: string }>(
         receiverChannel,
         "client-official-event",
-      ).pipe(
-        Effect.forkChild,
-        Effect.tap(() =>
-          Effect.sync(() =>
-            senderChannel.trigger("client-official-event", { message: "client-roundtrip" }),
-          ),
-        ),
-        Effect.flatMap(Fiber.join),
-      );
+      ).pipe(Effect.forkChild);
+      yield* realDelay(50);
+      yield* Effect.sync(() => {
+        expect(
+          senderChannel.trigger("client-official-event", { message: "client-roundtrip" }),
+        ).toBe(true);
+      });
+      const received = yield* Fiber.join(receivedFiber);
       expect(received).toEqual({ message: "client-roundtrip" });
     }),
   );
@@ -166,7 +176,8 @@ describe("official Pusher clients", () => {
     Effect.gen(function* () {
       const server = yield* makeServer();
       const first = yield* makeClient(server, { name: "One", userId: "user-one" });
-      const firstChannel = first.subscribe("presence-official-room");
+      const channel = testChannel("presence-official-room");
+      const firstChannel = first.subscribe(channel);
       yield* waitForEvent(firstChannel, "pusher:subscription_succeeded");
       const member = yield* waitForEvent<{
         readonly id: string;
@@ -177,7 +188,7 @@ describe("official Pusher clients", () => {
           Effect.gen(function* () {
             const second = yield* makeClient(server, { name: "Two", userId: "user-two" });
             yield* waitForEvent(
-              second.subscribe("presence-official-room"),
+              second.subscribe(channel),
               "pusher:subscription_succeeded",
             );
           }),
@@ -192,7 +203,8 @@ describe("official Pusher clients", () => {
     Effect.gen(function* () {
       const server = yield* makeServer(true);
       const client = yield* makeClient(server);
-      const channel = client.subscribe("private-encrypted-official-room");
+      const channelName = testChannel("private-encrypted-official-room");
+      const channel = client.subscribe(channelName);
       yield* waitForEvent(channel, "pusher:subscription_succeeded");
       const received = yield* waitForEvent<{ readonly message: string }>(
         channel,
@@ -200,7 +212,7 @@ describe("official Pusher clients", () => {
       ).pipe(
         Effect.forkChild,
         Effect.tap(() =>
-          trigger(server, "private-encrypted-official-room", "encrypted-event", {
+          trigger(server, channelName, "encrypted-event", {
             message: "secret-roundtrip",
           }),
         ),
