@@ -8,6 +8,7 @@ export interface WorkerNamesShape {
   readonly directory: string;
   readonly fanout: string;
   readonly public: string;
+  readonly registry: string;
   readonly user: string;
 }
 
@@ -38,6 +39,7 @@ export const WorkerNamesLive = Layer.effect(
         directory: `${base}-directory`,
         fanout: `${base}-fanout`,
         public: `${base}-public`,
+        registry: `${base}-registry`,
         user: `${base}-user`,
       };
     }),

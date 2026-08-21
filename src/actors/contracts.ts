@@ -2,6 +2,14 @@ import type { RuntimeContext } from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
 import type * as Effect from "effect/Effect";
 import type {
+  ApplicationBootstrap,
+  ApplicationCreate,
+  ApplicationPatch,
+  ApplicationSummary,
+  ProvisionedApplication,
+  RuntimeApplication,
+} from "../apps/model.ts";
+import type {
   ActorError,
   ChannelInfo,
   ChannelSnapshot,
@@ -70,6 +78,21 @@ export interface UserShardApi {
   readonly terminate: (userId: string) => ActorEffect<number>;
 }
 
+export interface AppRegistryApi {
+  readonly bootstrap: (input: ApplicationBootstrap) => ActorEffect<RuntimeApplication>;
+  readonly create: (input: ApplicationCreate) => ActorEffect<ProvisionedApplication>;
+  readonly get: (appId: string) => ActorEffect<ApplicationSummary | null>;
+  readonly list: () => ActorEffect<ReadonlyArray<ApplicationSummary>>;
+  readonly remove: (appId: string) => ActorEffect<boolean>;
+  readonly resolveByAuthToken: (authToken: string) => ActorEffect<RuntimeApplication | null>;
+  readonly resolveById: (appId: string) => ActorEffect<RuntimeApplication | null>;
+  readonly resolveByKey: (appKey: string) => ActorEffect<RuntimeApplication | null>;
+  readonly update: (
+    appId: string,
+    patch: ApplicationPatch,
+  ) => ActorEffect<ApplicationSummary>;
+}
+
 export class ConnectionShard extends Cloudflare.DurableObject<
   ConnectionShard,
   ConnectionShardApi
@@ -90,6 +113,10 @@ export class ChannelDirectoryShard extends Cloudflare.DurableObject<
 
 export class UserShard extends Cloudflare.DurableObject<UserShard, UserShardApi>()("UserShard") {}
 
+export class AppRegistry extends Cloudflare.DurableObject<AppRegistry, AppRegistryApi>()(
+  "AppRegistry",
+) {}
+
 export class ConnectionHost extends Cloudflare.Worker<ConnectionHost, {}, ConnectionShard>()(
   "ConnectionHost",
 ) {}
@@ -105,5 +132,9 @@ export class DirectoryHost extends Cloudflare.Worker<
 >()("DirectoryHost") {}
 
 export class UserHost extends Cloudflare.Worker<UserHost, {}, UserShard>()("UserHost") {}
+
+export class RegistryHost extends Cloudflare.Worker<RegistryHost, {}, AppRegistry>()(
+  "RegistryHost",
+) {}
 
 export class PusherWorker extends Cloudflare.Worker<PusherWorker, {}>()("DurablePusher") {}

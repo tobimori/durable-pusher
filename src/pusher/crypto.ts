@@ -10,6 +10,8 @@ export const md5Hex = (bytes: Uint8Array): string => bytesToHex(md5(bytes));
 export const hmacSha256Hex = (secret: string, message: string): string =>
   bytesToHex(hmac(sha256, utf8ToBytes(secret), utf8ToBytes(message)));
 
+export const sha256Hex = (value: string): string => bytesToHex(sha256(utf8ToBytes(value)));
+
 export const timingSafeEqual = (left: string, right: string): boolean => {
   const leftBytes = utf8ToBytes(left);
   const rightBytes = utf8ToBytes(right);

@@ -6,6 +6,7 @@ import ChannelHostLive, { ChannelHost } from "./src/hosts/channel.ts";
 import ConnectionHostLive, { ConnectionHost } from "./src/hosts/connection.ts";
 import DirectoryHostLive, { DirectoryHost } from "./src/hosts/directory.ts";
 import FanoutHostLive, { FanoutHost } from "./src/hosts/fanout.ts";
+import RegistryHostLive, { RegistryHost } from "./src/hosts/registry.ts";
 import UserHostLive, { UserHost } from "./src/hosts/user.ts";
 import PusherWorkerLive, { PusherWorker } from "./src/worker.ts";
 
@@ -15,6 +16,7 @@ const WorkersLive = Layer.mergeAll(
   ChannelHostLive,
   FanoutHostLive,
   DirectoryHostLive,
+  RegistryHostLive,
   UserHostLive,
 );
 
@@ -30,6 +32,7 @@ export default Alchemy.Stack(
     yield* ChannelHost;
     yield* FanoutHost;
     yield* DirectoryHost;
+    yield* RegistryHost;
     yield* UserHost;
     return {
       name: worker.workerName,
