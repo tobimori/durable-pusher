@@ -8,6 +8,17 @@
 - Scale storage and connection ownership by adding Durable Object instances.
 - Use Durable Object SQLite as actor-local state; do not use D1 as primary state.
 
+## Deployment topology
+
+One Cloudflare Worker script handles public ingress and exports all six Durable Object classes:
+`AppRegistry`, `ConnectionShard`, `ChannelShard`, `FanoutShard`, `ChannelDirectoryShard`, and
+`UserShard`. Inter-actor calls still resolve named Durable Objects through namespace bindings, so
+sharing one script does not combine storage, execution, placement, or request serialization.
+
+Cloudflare scales the stateless ingress isolates and each named Durable Object independently. A
+Worker deployment updates every actor class and disconnects active WebSockets, so clients must
+reconnect and rebuild subscriptions after releases.
+
 ## Actor graph
 
 ```text

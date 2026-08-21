@@ -6,7 +6,7 @@ import { ApplicationSummary, ProvisionedApplication } from "../src/apps/model.ts
 
 const enabled = process.env.PUSHER_E2E === "1";
 const host = process.env.PUSHER_E2E_HOST ?? "127.0.0.1";
-const port = Number(process.env.PUSHER_E2E_PORT ?? "1338");
+const port = Number(process.env.PUSHER_E2E_PORT ?? "1337");
 const useTLS = process.env.PUSHER_E2E_TLS === "1";
 const controlToken = process.env.PUSHER_CONTROL_TOKEN ?? "control-token";
 const origin = `${useTLS ? "https" : "http"}://${host}:${port}`;

@@ -61,7 +61,7 @@ func TestOfficialGoSDK(t *testing.T) {
 
 	host := os.Getenv("PUSHER_GO_E2E_HOST")
 	if host == "" {
-		host = "127.0.0.1:1338"
+		host = "127.0.0.1:1337"
 	}
 	scheme := "http"
 	secure := os.Getenv("PUSHER_GO_E2E_TLS") == "1"

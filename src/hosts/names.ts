@@ -3,13 +3,7 @@ import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 
 export interface WorkerNamesShape {
-  readonly channel: string;
-  readonly connection: string;
-  readonly directory: string;
-  readonly fanout: string;
-  readonly public: string;
-  readonly registry: string;
-  readonly user: string;
+  readonly worker: string;
 }
 
 export class WorkerNames extends Context.Service<WorkerNames, WorkerNamesShape>()(
@@ -33,15 +27,7 @@ export const WorkerNamesLive = Layer.effect(
   }).pipe(
     Config.map(({ prefix, stage }) => {
       const base = `${sanitize(prefix)}-${sanitize(stage)}`.slice(0, 48);
-      return {
-        channel: `${base}-channel`,
-        connection: `${base}-connection`,
-        directory: `${base}-directory`,
-        fanout: `${base}-fanout`,
-        public: `${base}-public`,
-        registry: `${base}-registry`,
-        user: `${base}-user`,
-      };
+      return { worker: base };
     }),
   ),
 );

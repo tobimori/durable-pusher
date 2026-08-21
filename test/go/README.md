@@ -8,7 +8,7 @@ With the local stack running:
 
 ```sh
 PUSHER_GO_E2E=1 \
-PUSHER_GO_E2E_HOST=127.0.0.1:1338 \
+PUSHER_GO_E2E_HOST=127.0.0.1:1337 \
 PUSHER_CONTROL_TOKEN=control-token \
 mise exec go@1.25 -- go test -v ./...
 ```

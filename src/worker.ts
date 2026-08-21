@@ -8,16 +8,29 @@ import * as Schema from "effect/Schema";
 import * as Headers from "effect/unstable/http/Headers";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
+import { ChannelShardLive } from "./actors/channel.ts";
+import { ConnectionShardLive } from "./actors/connection.ts";
 import {
   AppRegistry,
   ChannelDirectoryShard,
   ChannelShard,
   ConnectionShard,
+  FanoutShard,
   PusherWorker,
   UserShard,
 } from "./actors/contracts.ts";
-import { HttpActorDependencies } from "./actors/dependencies.ts";
+import {
+  ChannelActorDependencies,
+  ConnectionActorDependencies,
+  FanoutActorDependencies,
+  HttpActorDependencies,
+  UserActorDependencies,
+} from "./actors/dependencies.ts";
+import { ChannelDirectoryShardLive } from "./actors/directory.ts";
+import { FanoutShardLive } from "./actors/fanout.ts";
 import { makePlacedNamespace } from "./actors/placement.ts";
+import { AppRegistryLive } from "./actors/registry.ts";
+import { UserShardLive } from "./actors/user.ts";
 import {
   ApplicationBootstrap,
   type ApplicationPlacement,
@@ -60,7 +73,7 @@ export const PusherWorkerLive = PusherWorker.make(
   Effect.gen(function* () {
     const names = yield* WorkerNames;
     return {
-      name: names.public,
+      name: names.worker,
       main: import.meta.url,
       compatibility: {
         date: "2026-07-11",
@@ -82,19 +95,75 @@ export const PusherWorkerLive = PusherWorker.make(
     };
   }),
   Effect.gen(function* () {
-    const names = yield* WorkerNames;
     const environment = yield* Cloudflare.WorkerEnvironment;
-    const applications = yield* AppRegistry.from(names.registry);
-    const connections = yield* ConnectionShard.from(names.connection);
+    const applications = yield* AppRegistry.from(PusherWorker);
+    const channels = yield* ChannelShard.from(PusherWorker);
+    const connections = yield* ConnectionShard.from(PusherWorker);
+    const directories = yield* ChannelDirectoryShard.from(PusherWorker);
+    const fanouts = yield* FanoutShard.from(PusherWorker);
+    const users = yield* UserShard.from(PusherWorker);
+    const placedChannels = makePlacedNamespace("ChannelShard", channels, environment);
     const placedConnections = makePlacedNamespace("ConnectionShard", connections, environment);
-    const channels = yield* ChannelShard.from(names.channel);
-    const directories = yield* ChannelDirectoryShard.from(names.directory);
-    const users = yield* UserShard.from(names.user);
+    const placedDirectories = makePlacedNamespace(
+      "ChannelDirectoryShard",
+      directories,
+      environment,
+    );
+    const placedFanouts = makePlacedNamespace("FanoutShard", fanouts, environment);
+    const placedUsers = makePlacedNamespace("UserShard", users, environment);
+    const actorsLive = Layer.mergeAll(
+      AppRegistryLive,
+      ChannelDirectoryShardLive,
+      ChannelShardLive.pipe(
+        Layer.provide(
+          Layer.succeed(ChannelActorDependencies, {
+            directories: placedDirectories,
+            fanouts: placedFanouts,
+          }),
+        ),
+      ),
+      ConnectionShardLive.pipe(
+        Layer.provide(
+          Layer.succeed(ConnectionActorDependencies, {
+            applications,
+            channels: placedChannels,
+            fanouts: placedFanouts,
+            users: placedUsers,
+          }),
+        ),
+      ),
+      FanoutShardLive.pipe(
+        Layer.provide(
+          Layer.succeed(FanoutActorDependencies, {
+            channels: placedChannels,
+            connections: placedConnections,
+          }),
+        ),
+      ),
+      UserShardLive.pipe(
+        Layer.provide(
+          Layer.succeed(UserActorDependencies, {
+            connections: placedConnections,
+          }),
+        ),
+      ),
+    );
+    yield* Effect.all(
+      [
+        AppRegistry,
+        ChannelDirectoryShard,
+        ChannelShard,
+        ConnectionShard,
+        FanoutShard,
+        UserShard,
+      ],
+      { concurrency: "unbounded", discard: true },
+    ).pipe(Effect.provide(actorsLive));
     const httpDependencies = Layer.succeed(HttpActorDependencies, {
       applications,
-      channels: makePlacedNamespace("ChannelShard", channels, environment),
-      directories: makePlacedNamespace("ChannelDirectoryShard", directories, environment),
-      users: makePlacedNamespace("UserShard", users, environment),
+      channels: placedChannels,
+      directories: placedDirectories,
+      users: placedUsers,
     });
     const http = yield* makePusherHttp.pipe(Effect.provide(httpDependencies));
     const config = yield* AppConfig;

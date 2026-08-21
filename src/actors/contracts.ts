@@ -135,24 +135,13 @@ export class AppRegistry extends Cloudflare.DurableObject<AppRegistry, AppRegist
   "AppRegistry",
 ) {}
 
-export class ConnectionHost extends Cloudflare.Worker<ConnectionHost, {}, ConnectionShard>()(
-  "ConnectionHost",
-) {}
-
-export class ChannelHost extends Cloudflare.Worker<ChannelHost, {}, ChannelShard>()(
-  "ChannelHost",
-) {}
-
-export class FanoutHost extends Cloudflare.Worker<FanoutHost, {}, FanoutShard>()("FanoutHost") {}
-
-export class DirectoryHost extends Cloudflare.Worker<DirectoryHost, {}, ChannelDirectoryShard>()(
-  "DirectoryHost",
-) {}
-
-export class UserHost extends Cloudflare.Worker<UserHost, {}, UserShard>()("UserHost") {}
-
-export class RegistryHost extends Cloudflare.Worker<RegistryHost, {}, AppRegistry>()(
-  "RegistryHost",
-) {}
-
-export class PusherWorker extends Cloudflare.Worker<PusherWorker, {}>()("DurablePusher") {}
+export class PusherWorker extends Cloudflare.Worker<
+  PusherWorker,
+  {},
+  | AppRegistry
+  | ChannelDirectoryShard
+  | ChannelShard
+  | ConnectionShard
+  | FanoutShard
+  | UserShard
+>()("DurablePusher") {}
