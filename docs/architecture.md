@@ -60,6 +60,19 @@ roots update a hash-partitioned set of directory actors on occupancy changes. In
 queries go directly to the channel root. This avoids a single per-app directory database while
 retaining Pusher's unpaginated listing endpoint within practical response limits.
 
+### Application placement
+
+The global application registry resolves public keys, app IDs, and authorization tokens to an
+immutable `(app_id, jurisdiction, location_hint)` placement. Ingress and every cross-actor call use
+that placement when resolving a named Durable Object. Actor-local metadata pins the same identity
+and rejects cross-tenant or cross-placement reuse.
+
+Production jurisdiction routing uses Cloudflare's native restricted namespace before `getByName`;
+location hints are supplied to that lookup. The local workerd emulator explicitly does not
+implement jurisdiction restrictions, so the adapter falls back only when workerd returns its exact
+not-implemented error. This permits local protocol tests but does not validate jurisdiction
+enforcement, which still requires a Cloudflare deployment.
+
 ## Subscription barrier
 
 1. The connection shard inserts a local `joining` membership.
@@ -67,8 +80,10 @@ retaining Pusher's unpaginated listing endpoint within practical response limits
 3. The branch updates its gateway aggregate and sends its absolute branch count to the root.
 4. The root returns its latest publication sequence and channel snapshot.
 5. Delivery at or below that barrier is discarded; later delivery is buffered while joining.
-6. The gateway sends cache/presence data and `subscription_succeeded`.
-7. The membership becomes `active` and buffered events are flushed in sequence order.
+6. The gateway sends any cache snapshot or cache-miss event.
+7. The local membership becomes `active`.
+8. The gateway sends `subscription_succeeded`.
+9. Buffered events are flushed in sequence order.
 
 Unsubscribe deletes local membership before remote count propagation, so late fanout is dropped.
 

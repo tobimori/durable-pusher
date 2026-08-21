@@ -42,13 +42,24 @@ export const makePlacedNamespace = <Stub>(
     Effect.gen(function* () {
       const locationHint = placement.locationHint;
       const jurisdiction = placement.jurisdiction;
+      const getDefault = () =>
+        Option.isNone(locationHint)
+          ? namespace.getByName(name)
+          : namespace.getByName(name, { locationHint: locationHint.value });
+      const placementError = (cause: unknown) =>
+        new PlacementError({
+          cause,
+          message: `Could not route ${bindingName} in the requested placement`,
+          namespace: bindingName,
+        });
+      if (Option.isNone(jurisdiction)) {
+        return yield* Effect.try({
+          try: getDefault,
+          catch: placementError,
+        });
+      }
       return yield* Effect.try({
         try: () => {
-          if (Option.isNone(jurisdiction)) {
-            return Option.isNone(locationHint)
-              ? namespace.getByName(name)
-              : namespace.getByName(name, { locationHint: locationHint.value });
-          }
           const nativeNamespace = Option.getOrThrow(Option.fromNullishOr(environment[bindingName]));
           const restricted = nativeNamespace.jurisdiction(jurisdiction.value);
           const stub = Option.isNone(locationHint)
@@ -56,12 +67,14 @@ export const makePlacedNamespace = <Stub>(
             : restricted.getByName(name, { locationHint: locationHint.value });
           return Cloudflare.makeRpcStub<Stub>(stub);
         },
-        catch: (cause) =>
-          new PlacementError({
-            cause,
-            message: `Could not route ${bindingName} in the requested placement`,
-            namespace: bindingName,
-          }),
-      });
+        catch: placementError,
+      }).pipe(
+        Effect.catch((error) =>
+          // workerd does not emulate jurisdiction namespaces; production still uses the native restriction.
+          String(error.cause).includes("Jurisdiction restrictions are not implemented in workerd")
+            ? Effect.try({ try: getDefault, catch: placementError })
+            : Effect.fail(error),
+        ),
+      );
     }),
 });
