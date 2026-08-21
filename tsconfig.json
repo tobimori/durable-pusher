@@ -7,11 +7,48 @@
     "moduleResolution": "Bundler",
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnostics": true,
+        "includeSuggestionsInTsc": true,
+        "ignoreEffectErrorsInTscExitCode": false,
+        "ignoreEffectWarningsInTscExitCode": false,
+        "namespaceImportPackages": ["effect", "@effect/*"],
+        "diagnosticSeverity": {
+          "anyUnknownInErrorContext": "error",
+          "asyncFunction": "error",
+          "effectFnOpportunity": "warning",
+          "floatingEffect": "error",
+          "globalDate": "error",
+          "globalDateInEffect": "error",
+          "globalErrorInEffectCatch": "error",
+          "globalErrorInEffectFailure": "error",
+          "lazyPromiseInEffectSync": "error",
+          "newPromise": "error",
+          "outdatedApi": "error",
+          "preferSchemaOverJson": "warning",
+          "promiseInEffectSuccess": "error",
+          "runEffectInsideEffect": "error",
+          "schemaSyncInEffect": "warning",
+          "tryCatchInEffectGen": "error",
+          "unknownInEffectCatch": "error"
+        }
+      }
+    ],
     "skipLibCheck": true,
     "strict": true,
     "target": "ESNext",
     "types": ["@cloudflare/workers-types"],
     "verbatimModuleSyntax": true
   },
-  "include": ["alchemy.run.ts", "src/**/*.ts", "test/**/*.ts", "vite.config.ts"]
+  "include": [
+    "alchemy.run.ts",
+    "drizzle.config.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "vite.config.ts"
+  ]
 }
