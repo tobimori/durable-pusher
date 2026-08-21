@@ -15,6 +15,7 @@
     "prepare": "effect-tsgo patch",
     "tail": "alchemy tail",
     "test": "vp test run",
+    "test:load:connections": "node test/load-connections.mjs",
     "test:watch": "vp test"
   },
   "dependencies": {
