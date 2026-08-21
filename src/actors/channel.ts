@@ -3,7 +3,11 @@ import * as Drizzle from "alchemy/Drizzle/Cloudflare";
 import { and, count, countDistinct, eq, gt, sql } from "drizzle-orm";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
+import { ApplicationPlacement, type ApplicationPlacementEncoded } from "../apps/model.ts";
 import migrations from "../db/migrations.ts";
 import {
   branchDeliveries,
@@ -18,13 +22,14 @@ import {
   ActorError,
   classifyChannel,
   decodeJson,
+  Delivery,
   encodeJson,
   mapActorError,
+  PresenceJoin,
   type CachedEvent,
   type ChannelInfo,
   type ChannelSnapshot,
-  type Delivery,
-  type PresenceJoin,
+  type PresenceJoinEncoded,
   type PresenceMember,
   type PresenceSnapshot,
 } from "../pusher/protocol.ts";
@@ -67,35 +72,67 @@ export const ChannelShardLive = ChannelShard.make(
       const pumpLock = yield* Ref.make(false);
 
       const ensureMetadata = Effect.fn("ChannelShard.ensureMetadata")(function* (
-        appId: string,
+        placement: ApplicationPlacement,
         channel: string,
       ) {
         yield* db
           .insert(channelMetadata)
-          .values({ appId, channel, singleton: 1 })
+          .values({
+            appId: placement.appId,
+            channel,
+            jurisdiction: Option.getOrNull(placement.jurisdiction),
+            locationHint: Option.getOrNull(placement.locationHint),
+            singleton: 1,
+          })
           .onConflictDoNothing();
         const rows = yield* db
-          .select({ appId: channelMetadata.appId, channel: channelMetadata.channel })
+          .select({
+            appId: channelMetadata.appId,
+            channel: channelMetadata.channel,
+            jurisdiction: channelMetadata.jurisdiction,
+            locationHint: channelMetadata.locationHint,
+          })
           .from(channelMetadata)
           .where(eq(channelMetadata.singleton, 1))
           .limit(1);
-        const metadata = rows[0];
-        if (metadata?.appId !== appId || metadata.channel !== channel) {
+        const metadata = Option.fromNullishOr(rows[0]);
+        if (Option.isNone(metadata)) {
+          return yield* failActor("metadata", "Channel shard metadata is missing");
+        }
+        if (
+          metadata.value.appId !== placement.appId ||
+          metadata.value.channel !== channel ||
+          !Equal.equals(
+            Option.fromNullishOr(metadata.value.jurisdiction),
+            placement.jurisdiction,
+          ) ||
+          !Equal.equals(Option.fromNullishOr(metadata.value.locationHint), placement.locationHint)
+        ) {
           return yield* failActor("metadata", "Channel shard identity mismatch");
         }
       });
 
       const getMetadata = Effect.fn("ChannelShard.getMetadata")(function* () {
         const rows = yield* db
-          .select({ appId: channelMetadata.appId, channel: channelMetadata.channel })
+          .select({
+            appId: channelMetadata.appId,
+            channel: channelMetadata.channel,
+            jurisdiction: channelMetadata.jurisdiction,
+            locationHint: channelMetadata.locationHint,
+          })
           .from(channelMetadata)
           .where(eq(channelMetadata.singleton, 1))
           .limit(1);
-        const metadata = rows[0];
-        if (metadata === undefined) {
+        const metadata = Option.fromNullishOr(rows[0]);
+        if (Option.isNone(metadata)) {
           return yield* failActor("metadata", "Channel shard metadata is missing");
         }
-        return metadata;
+        return {
+          appId: metadata.value.appId,
+          channel: metadata.value.channel,
+          jurisdiction: Option.fromNullishOr(metadata.value.jurisdiction),
+          locationHint: Option.fromNullishOr(metadata.value.locationHint),
+        };
       });
 
       const currentSequence = Effect.fn("ChannelShard.currentSequence")(function* () {
@@ -218,10 +255,14 @@ export const ChannelShardLive = ChannelShard.make(
       });
 
       const syncDirectory = Effect.fn("ChannelShard.syncDirectory")(function* (
-        appId: string,
+        placement: ApplicationPlacement,
         channel: string,
       ) {
-        yield* directories.getByName(directoryShardName(appId, channel)).set({
+        const directory = yield* directories.getByName(
+          directoryShardName(placement.appId, channel),
+          placement,
+        );
+        yield* directory.set({
           channel,
           subscriptionCount: yield* subscriptionCount(),
           userCount: yield* userCount(),
@@ -265,33 +306,34 @@ export const ChannelShardLive = ChannelShard.make(
             }
 
             const delivery: Delivery = {
+              appId: metadata.appId,
               channel: metadata.channel,
               data: outbox.data,
               event: outbox.event,
+              jurisdiction: metadata.jurisdiction,
+              locationHint: metadata.locationHint,
               sequence: outbox.sequence,
               ...(outbox.excludedSocketId === null
                 ? {}
                 : { excludedSocketId: outbox.excludedSocketId }),
               ...(outbox.userId === null ? {} : { userId: outbox.userId }),
             };
-            yield* fanouts
-              .getByName(branch.branchName)
-              .deliver(delivery)
-              .pipe(
-                Effect.mapError(mapActorError("FanoutShard", "deliver")),
-                Effect.catch(
-                  Effect.fn("ChannelShard.deferDelivery")(function* (error) {
-                    yield* Effect.logWarning("channel branch delivery deferred").pipe(
-                      Effect.annotateLogs({
-                        branchName: branch.branchName,
-                        message: error.message,
-                        sequence: outbox.sequence,
-                      }),
-                    );
-                    return yield* Effect.fail(DELIVERY_DEFERRED);
-                  }),
-                ),
-              );
+            const fanout = yield* fanouts.getByName(branch.branchName, metadata);
+            yield* fanout.deliver(yield* Schema.encodeEffect(Delivery)(delivery)).pipe(
+              Effect.mapError(mapActorError("FanoutShard", "deliver")),
+              Effect.catch(
+                Effect.fn("ChannelShard.deferDelivery")(function* (error) {
+                  yield* Effect.logWarning("channel branch delivery deferred").pipe(
+                    Effect.annotateLogs({
+                      branchName: branch.branchName,
+                      message: error.message,
+                      sequence: outbox.sequence,
+                    }),
+                  );
+                  return yield* Effect.fail(DELIVERY_DEFERRED);
+                }),
+              ),
+            );
             yield* db
               .insert(branchDeliveries)
               .values({ branchName: branch.branchName, sequence: outbox.sequence })
@@ -372,13 +414,14 @@ export const ChannelShardLive = ChannelShard.make(
       });
 
       const setBranch = Effect.fn("ChannelShard.setBranch")(function* (
-        appId: string,
+        placement: ApplicationPlacementEncoded,
         channel: string,
         branchName: string,
         branchSubscriptionCount: number,
         generation: number,
       ) {
-        yield* ensureMetadata(appId, channel);
+        const decodedPlacement = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
+        yield* ensureMetadata(decodedPlacement, channel);
         const previousTotal = yield* subscriptionCount();
         const current = yield* db
           .select({ generation: channelBranches.generation })
@@ -406,7 +449,7 @@ export const ChannelShardLive = ChannelShard.make(
           yield* enqueue("pusher_internal:subscription_count", data);
         }
 
-        yield* syncDirectory(appId, channel);
+        yield* syncDirectory(decodedPlacement, channel);
         yield* schedulePump();
         return {
           barrier: yield* currentSequence(),
@@ -415,32 +458,35 @@ export const ChannelShardLive = ChannelShard.make(
         } satisfies ChannelSnapshot;
       }, operationError("setBranch"));
 
-      const joinPresence = Effect.fn("ChannelShard.joinPresence")(function* (join: PresenceJoin) {
-        yield* ensureMetadata(join.appId, join.channel);
+      const joinPresence = Effect.fn("ChannelShard.joinPresence")(function* (
+        join: PresenceJoinEncoded,
+      ) {
+        const decodedJoin = yield* Schema.decodeEffect(PresenceJoin)(join);
+        yield* ensureMetadata(decodedJoin, decodedJoin.channel);
         const existing = yield* db
           .select({ userId: presenceMembers.userId })
           .from(presenceMembers)
-          .where(eq(presenceMembers.socketId, join.socketId))
+          .where(eq(presenceMembers.socketId, decodedJoin.socketId))
           .limit(1);
 
         if (existing[0] === undefined) {
-          const wasPresent = (yield* userConnectionCount(join.userId)) > 0;
+          const wasPresent = (yield* userConnectionCount(decodedJoin.userId)) > 0;
           yield* db.insert(presenceMembers).values({
-            branchName: join.branchName,
-            socketId: join.socketId,
-            userId: join.userId,
-            userInfo: yield* encodeJson(join.userInfo),
+            branchName: decodedJoin.branchName,
+            socketId: decodedJoin.socketId,
+            userId: decodedJoin.userId,
+            userInfo: yield* encodeJson(decodedJoin.userInfo),
           });
           if (!wasPresent) {
             const data = yield* encodeJson({
-              user_id: join.userId,
-              user_info: join.userInfo,
+              user_id: decodedJoin.userId,
+              user_info: decodedJoin.userInfo,
             });
-            yield* enqueue("pusher_internal:member_added", data, join.socketId);
+            yield* enqueue("pusher_internal:member_added", data, decodedJoin.socketId);
           }
         }
 
-        yield* syncDirectory(join.appId, join.channel);
+        yield* syncDirectory(decodedJoin, decodedJoin.channel);
         yield* schedulePump();
         return {
           barrier: yield* currentSequence(),
@@ -449,11 +495,12 @@ export const ChannelShardLive = ChannelShard.make(
       }, operationError("joinPresence"));
 
       const leavePresence = Effect.fn("ChannelShard.leavePresence")(function* (
-        appId: string,
+        placement: ApplicationPlacementEncoded,
         channel: string,
         socketId: string,
       ) {
-        yield* ensureMetadata(appId, channel);
+        const decodedPlacement = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
+        yield* ensureMetadata(decodedPlacement, channel);
         const existing = yield* db
           .select({ userId: presenceMembers.userId })
           .from(presenceMembers)
@@ -469,12 +516,12 @@ export const ChannelShardLive = ChannelShard.make(
           }
         }
 
-        yield* syncDirectory(appId, channel);
+        yield* syncDirectory(decodedPlacement, channel);
         yield* schedulePump();
       }, operationError("leavePresence"));
 
       const publish = Effect.fn("ChannelShard.publish")(function* (
-        appId: string,
+        placement: ApplicationPlacementEncoded,
         channel: string,
         event: string,
         data: string,
@@ -482,7 +529,8 @@ export const ChannelShardLive = ChannelShard.make(
         userId: string | null,
         updateCache: boolean,
       ) {
-        yield* ensureMetadata(appId, channel);
+        const decodedPlacement = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
+        yield* ensureMetadata(decodedPlacement, channel);
         const createdAt = yield* Clock.currentTimeMillis;
         yield* db.transaction(
           Effect.fn("ChannelShard.publishTransaction")(function* (tx) {
@@ -529,11 +577,19 @@ export const ChannelShardLive = ChannelShard.make(
         return yield* getInfo();
       }, operationError("publish"));
 
-      const info = Effect.fn("ChannelShard.info")(function* () {
+      const info = Effect.fn("ChannelShard.info")(function* (
+        placement: ApplicationPlacementEncoded,
+        channel: string,
+      ) {
+        yield* ensureMetadata(yield* Schema.decodeEffect(ApplicationPlacement)(placement), channel);
         return yield* getInfo();
       }, operationError("info"));
 
-      const presenceUsers = Effect.fn("ChannelShard.presenceUsers")(function* () {
+      const presenceUsers = Effect.fn("ChannelShard.presenceUsers")(function* (
+        placement: ApplicationPlacementEncoded,
+        channel: string,
+      ) {
+        yield* ensureMetadata(yield* Schema.decodeEffect(ApplicationPlacement)(placement), channel);
         const members = yield* getPresenceMembers();
         return members.map((member) => member.userId);
       }, operationError("presenceUsers"));

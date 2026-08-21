@@ -1,3 +1,4 @@
+import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { ChannelShardLive } from "../actors/channel.ts";
@@ -8,6 +9,7 @@ import {
   FanoutShard,
 } from "../actors/contracts.ts";
 import { ChannelActorDependencies } from "../actors/dependencies.ts";
+import { makePlacedNamespace } from "../actors/placement.ts";
 import { WorkerNames, WorkerNamesLive } from "./names.ts";
 
 export { ChannelHost };
@@ -19,12 +21,14 @@ export const ChannelHostLive = ChannelHost.make(
   }),
   Effect.gen(function* () {
     const names = yield* WorkerNames;
+    const environment = yield* Cloudflare.WorkerEnvironment;
     const fanouts = yield* FanoutShard.from(names.fanout);
     const directories = yield* ChannelDirectoryShard.from(names.directory);
-    const dependencies = Layer.succeed(ChannelActorDependencies, { directories, fanouts });
-    yield* ChannelShard.pipe(
-      Effect.provide(ChannelShardLive.pipe(Layer.provide(dependencies))),
-    );
+    const dependencies = Layer.succeed(ChannelActorDependencies, {
+      directories: makePlacedNamespace("ChannelDirectoryShard", directories, environment),
+      fanouts: makePlacedNamespace("FanoutShard", fanouts, environment),
+    });
+    yield* ChannelShard.pipe(Effect.provide(ChannelShardLive.pipe(Layer.provide(dependencies))));
     return {};
   }),
 ).pipe(Layer.provide(WorkerNamesLive));

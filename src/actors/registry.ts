@@ -3,14 +3,18 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { asc, eq, ne } from "drizzle-orm";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   ApplicationBootstrap,
   ApplicationCreate,
   ApplicationPatch,
-  type ApplicationSummary,
-  type ProvisionedApplication,
-  type RuntimeApplication,
+  ApplicationSummary,
+  ProvisionedApplication,
+  RuntimeApplication,
+  type ApplicationBootstrapEncoded,
+  type ApplicationCreateEncoded,
+  type ApplicationPatchEncoded,
 } from "../apps/model.ts";
 import registryMigrations from "../db/registry-migrations.ts";
 import { applications } from "../db/registry-schema.ts";
@@ -32,8 +36,8 @@ const toSummary = (row: ApplicationRow): ApplicationSummary => ({
   appId: row.appId,
   appKey: row.appKey,
   createdAt: row.createdAt,
-  jurisdiction: row.jurisdiction,
-  locationHint: row.locationHint,
+  jurisdiction: Option.fromNullishOr(row.jurisdiction),
+  locationHint: Option.fromNullishOr(row.locationHint),
   name: row.name,
   status: row.status,
   updatedAt: row.updatedAt,
@@ -48,6 +52,10 @@ const toRuntime = (row: ApplicationRow): RuntimeApplication => ({
 const randomHex = Effect.fn("AppRegistry.randomHex")((byteLength: number) =>
   Effect.sync(() => bytesToHex(crypto.getRandomValues(new Uint8Array(byteLength)))),
 );
+
+const encodeApplicationSummary = Schema.encodeEffect(ApplicationSummary);
+const encodeProvisionedApplication = Schema.encodeEffect(ProvisionedApplication);
+const encodeRuntimeApplication = Schema.encodeEffect(RuntimeApplication);
 
 const randomEncryptionKey = Effect.fn("AppRegistry.randomEncryptionKey")(function* () {
   const bytes = yield* Effect.sync(() => crypto.getRandomValues(new Uint8Array(32)));
@@ -65,14 +73,14 @@ export const AppRegistryLive = AppRegistry.make(
           .from(applications)
           .where(eq(applications.appId, appId))
           .limit(1);
-        return row;
+        return Option.fromNullishOr(row);
       }, operationError("rowById"));
 
-      const create = Effect.fn("AppRegistry.create")(function* (input: ApplicationCreate) {
+      const create = Effect.fn("AppRegistry.create")(function* (input: ApplicationCreateEncoded) {
         const decoded = yield* Schema.decodeEffect(ApplicationCreate)(input).pipe(
           Effect.mapError(() => actorError("create", "Invalid application settings")),
         );
-        const appId = decoded.appId ?? (yield* randomHex(8));
+        const appId = Option.isSome(decoded.appId) ? decoded.appId.value : yield* randomHex(8);
         const appKey = yield* randomHex(10);
         const appSecret = yield* randomHex(16);
         const authToken = yield* randomHex(24);
@@ -85,8 +93,8 @@ export const AppRegistryLive = AppRegistry.make(
           authTokenHash: sha256Hex(authToken),
           createdAt: now,
           encryptionMasterKey,
-          jurisdiction: decoded.jurisdiction ?? null,
-          locationHint: decoded.locationHint ?? null,
+          jurisdiction: Option.getOrNull(decoded.jurisdiction),
+          locationHint: Option.getOrNull(decoded.locationHint),
           name: decoded.name,
           status: "active",
           updatedAt: now,
@@ -98,24 +106,65 @@ export const AppRegistryLive = AppRegistry.make(
           authToken,
           createdAt: now,
           encryptionMasterKey,
-          jurisdiction: decoded.jurisdiction ?? null,
-          locationHint: decoded.locationHint ?? null,
+          jurisdiction: decoded.jurisdiction,
+          locationHint: decoded.locationHint,
           name: decoded.name,
           status: "active",
           updatedAt: now,
         };
-        return provisioned;
+        return yield* encodeProvisionedApplication(provisioned).pipe(
+          Effect.mapError(() => actorError("create", "Application could not be encoded")),
+        );
       }, operationError("create"));
 
       const bootstrap = Effect.fn("AppRegistry.bootstrap")(function* (
-        input: ApplicationBootstrap,
+        input: ApplicationBootstrapEncoded,
       ) {
         const decoded = yield* Schema.decodeEffect(ApplicationBootstrap)(input).pipe(
           Effect.mapError(() => actorError("bootstrap", "Invalid bootstrap application")),
         );
         const existing = yield* rowById(decoded.appId);
-        if (existing !== undefined) {
-          return toRuntime(existing);
+        if (Option.isSome(existing)) {
+          const current = existing.value;
+          const authTokenHash = sha256Hex(decoded.authToken);
+          const jurisdiction = Option.getOrNull(decoded.jurisdiction);
+          const locationHint = Option.getOrNull(decoded.locationHint);
+          if (
+            current.appKey !== decoded.appKey ||
+            current.appSecret !== decoded.appSecret ||
+            current.authTokenHash !== authTokenHash ||
+            current.encryptionMasterKey !== decoded.encryptionMasterKey ||
+            current.jurisdiction !== jurisdiction ||
+            current.locationHint !== locationHint ||
+            current.name !== decoded.name ||
+            current.status !== "active"
+          ) {
+            const updatedAt = yield* Clock.currentTimeMillis;
+            yield* db
+              .update(applications)
+              .set({
+                appKey: decoded.appKey,
+                appSecret: decoded.appSecret,
+                authTokenHash,
+                encryptionMasterKey: decoded.encryptionMasterKey,
+                jurisdiction,
+                locationHint,
+                name: decoded.name,
+                status: "active",
+                updatedAt,
+              })
+              .where(eq(applications.appId, decoded.appId));
+            const updated = yield* rowById(decoded.appId);
+            if (Option.isNone(updated)) {
+              return yield* actorError("bootstrap", "Bootstrap update was not persisted");
+            }
+            return yield* encodeRuntimeApplication(toRuntime(updated.value)).pipe(
+              Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
+            );
+          }
+          return yield* encodeRuntimeApplication(toRuntime(current)).pipe(
+            Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
+          );
         }
         const now = yield* Clock.currentTimeMillis;
         yield* db.insert(applications).values({
@@ -125,22 +174,32 @@ export const AppRegistryLive = AppRegistry.make(
           authTokenHash: sha256Hex(decoded.authToken),
           createdAt: now,
           encryptionMasterKey: decoded.encryptionMasterKey,
-          jurisdiction: decoded.jurisdiction ?? null,
-          locationHint: decoded.locationHint ?? null,
+          jurisdiction: Option.getOrNull(decoded.jurisdiction),
+          locationHint: Option.getOrNull(decoded.locationHint),
           name: decoded.name,
           status: "active",
           updatedAt: now,
         });
         const created = yield* rowById(decoded.appId);
-        if (created === undefined) {
+        if (Option.isNone(created)) {
           return yield* actorError("bootstrap", "Bootstrap application was not persisted");
         }
-        return toRuntime(created);
+        return yield* encodeRuntimeApplication(toRuntime(created.value)).pipe(
+          Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
+        );
       }, operationError("bootstrap"));
 
       const get = Effect.fn("AppRegistry.get")(function* (appId: string) {
         const row = yield* rowById(appId);
-        return row === undefined || row.status === "deleted" ? null : toSummary(row);
+        const summary = Option.filter(row, (value) => value.status !== "deleted").pipe(
+          Option.map(toSummary),
+        );
+        if (Option.isNone(summary)) {
+          return null;
+        }
+        return yield* encodeApplicationSummary(summary.value).pipe(
+          Effect.mapError(() => actorError("get", "Application could not be encoded")),
+        );
       });
 
       const list = Effect.fn("AppRegistry.list")(function* () {
@@ -149,12 +208,24 @@ export const AppRegistryLive = AppRegistry.make(
           .from(applications)
           .where(ne(applications.status, "deleted"))
           .orderBy(asc(applications.createdAt), asc(applications.appId));
-        return rows.map(toSummary);
+        return yield* Effect.forEach(rows, (row) =>
+          encodeApplicationSummary(toSummary(row)).pipe(
+            Effect.mapError(() => actorError("list", "Application could not be encoded")),
+          ),
+        );
       }, operationError("list"));
 
       const resolveById = Effect.fn("AppRegistry.resolveById")(function* (appId: string) {
         const row = yield* rowById(appId);
-        return row?.status === "active" ? toRuntime(row) : null;
+        const application = Option.filter(row, (value) => value.status === "active").pipe(
+          Option.map(toRuntime),
+        );
+        if (Option.isNone(application)) {
+          return null;
+        }
+        return yield* encodeRuntimeApplication(application.value).pipe(
+          Effect.mapError(() => actorError("resolveById", "Application could not be encoded")),
+        );
       });
 
       const resolveByKey = Effect.fn("AppRegistry.resolveByKey")(function* (appKey: string) {
@@ -163,7 +234,16 @@ export const AppRegistryLive = AppRegistry.make(
           .from(applications)
           .where(eq(applications.appKey, appKey))
           .limit(1);
-        return row?.status === "active" ? toRuntime(row) : null;
+        const application = Option.fromNullishOr(row).pipe(
+          Option.filter((value) => value.status === "active"),
+          Option.map(toRuntime),
+        );
+        if (Option.isNone(application)) {
+          return null;
+        }
+        return yield* encodeRuntimeApplication(application.value).pipe(
+          Effect.mapError(() => actorError("resolveByKey", "Application could not be encoded")),
+        );
       }, operationError("resolveByKey"));
 
       const resolveByAuthToken = Effect.fn("AppRegistry.resolveByAuthToken")(function* (
@@ -174,48 +254,56 @@ export const AppRegistryLive = AppRegistry.make(
           .from(applications)
           .where(eq(applications.authTokenHash, sha256Hex(authToken)))
           .limit(1);
-        return row?.status === "active" ? toRuntime(row) : null;
+        const application = Option.fromNullishOr(row).pipe(
+          Option.filter((value) => value.status === "active"),
+          Option.map(toRuntime),
+        );
+        if (Option.isNone(application)) {
+          return null;
+        }
+        return yield* encodeRuntimeApplication(application.value).pipe(
+          Effect.mapError(() =>
+            actorError("resolveByAuthToken", "Application could not be encoded"),
+          ),
+        );
       }, operationError("resolveByAuthToken"));
 
       const update = Effect.fn("AppRegistry.update")(function* (
         appId: string,
-        patch: ApplicationPatch,
+        patch: ApplicationPatchEncoded,
       ) {
         const decoded = yield* Schema.decodeEffect(ApplicationPatch)(patch).pipe(
           Effect.mapError(() => actorError("update", "Invalid application settings")),
         );
         const current = yield* rowById(appId);
-        if (current === undefined || current.status === "deleted") {
+        if (Option.isNone(current) || current.value.status === "deleted") {
           return yield* actorError("update", "Application does not exist");
         }
+        const currentValue = current.value;
         const updatedAt = yield* Clock.currentTimeMillis;
         yield* db
           .update(applications)
           .set({
-            jurisdiction:
-              "jurisdiction" in decoded ? decoded.jurisdiction : current.jurisdiction,
-            locationHint:
-              "locationHint" in decoded ? decoded.locationHint : current.locationHint,
-            name: decoded.name ?? current.name,
-            status:
-              decoded.enabled === undefined
-                ? current.status
-                : decoded.enabled
-                  ? "active"
-                  : "disabled",
+            name: Option.getOrElse(decoded.name, () => currentValue.name),
+            status: Option.match(decoded.enabled, {
+              onNone: () => currentValue.status,
+              onSome: (enabled) => (enabled ? "active" : "disabled"),
+            }),
             updatedAt,
           })
           .where(eq(applications.appId, appId));
         const updated = yield* rowById(appId);
-        if (updated === undefined) {
+        if (Option.isNone(updated)) {
           return yield* actorError("update", "Application update was not persisted");
         }
-        return toSummary(updated);
+        return yield* encodeApplicationSummary(toSummary(updated.value)).pipe(
+          Effect.mapError(() => actorError("update", "Application could not be encoded")),
+        );
       }, operationError("update"));
 
       const remove = Effect.fn("AppRegistry.remove")(function* (appId: string) {
         const current = yield* rowById(appId);
-        if (current === undefined || current.status === "deleted") {
+        if (Option.isNone(current) || current.value.status === "deleted") {
           return false;
         }
         const updatedAt = yield* Clock.currentTimeMillis;

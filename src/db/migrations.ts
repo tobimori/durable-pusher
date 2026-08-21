@@ -25,5 +25,12 @@ export default {
     "0001_fanout_branch_name": `
       ALTER TABLE fanout_metadata ADD COLUMN branch_name TEXT NOT NULL DEFAULT '';
     `,
+    "0002_application_placement": `
+      ALTER TABLE channel_metadata ADD COLUMN jurisdiction TEXT;
+      ALTER TABLE channel_metadata ADD COLUMN location_hint TEXT;
+      ALTER TABLE fanout_metadata ADD COLUMN jurisdiction TEXT;
+      ALTER TABLE fanout_metadata ADD COLUMN location_hint TEXT;
+      CREATE TABLE user_metadata (singleton INTEGER PRIMARY KEY NOT NULL, app_id TEXT NOT NULL, user_id TEXT NOT NULL, jurisdiction TEXT, location_hint TEXT);
+    `,
   },
 };

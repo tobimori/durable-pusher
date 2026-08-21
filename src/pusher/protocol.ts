@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { ApplicationPlacement } from "../apps/model.ts";
 
 export const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_\-=@,.;]{1,164}$/;
 export const SOCKET_ID_PATTERN = /^\d+\.\d+$/;
@@ -82,6 +83,7 @@ export const PublishedEvent = Schema.Struct({
 
 export const Delivery = Schema.Struct({
   ...PublishedEvent.fields,
+  ...ApplicationPlacement.fields,
   sequence: Schema.Int,
 });
 
@@ -108,7 +110,7 @@ export const PresenceSnapshot = Schema.Struct({
 });
 
 export const PresenceJoin = Schema.Struct({
-  appId: Schema.String,
+  ...ApplicationPlacement.fields,
   branchName: Schema.String,
   channel: Schema.String,
   socketId: Schema.String,
@@ -130,7 +132,7 @@ export const DirectoryEntry = Schema.Struct({
 });
 
 export const Attachment = Schema.Struct({
-  appId: Schema.String,
+  ...ApplicationPlacement.fields,
   protocol: Schema.Int,
   shardName: Schema.String,
   socketId: Schema.String,
@@ -142,11 +144,13 @@ export type ClientFrame = typeof ClientFrame.Type;
 export type ServerEvent = typeof ServerEvent.Type;
 export type PublishedEvent = typeof PublishedEvent.Type;
 export type Delivery = typeof Delivery.Type;
+export type DeliveryEncoded = typeof Delivery.Encoded;
 export type CachedEvent = typeof CachedEvent.Type;
 export type ChannelSnapshot = typeof ChannelSnapshot.Type;
 export type PresenceMember = typeof PresenceMember.Type;
 export type PresenceSnapshot = typeof PresenceSnapshot.Type;
 export type PresenceJoin = typeof PresenceJoin.Type;
+export type PresenceJoinEncoded = typeof PresenceJoin.Encoded;
 export type ChannelInfo = typeof ChannelInfo.Type;
 export type DirectoryEntry = typeof DirectoryEntry.Type;
 export type Attachment = typeof Attachment.Type;

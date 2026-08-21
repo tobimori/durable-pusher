@@ -54,6 +54,10 @@ export const channelMetadata = sqliteTable("channel_metadata", {
   singleton: integer("singleton").primaryKey(),
   appId: text("app_id").notNull(),
   channel: text("channel").notNull(),
+  jurisdiction: text("jurisdiction", { enum: ["eu", "fedramp", "fedramp-high", "us"] }),
+  locationHint: text("location_hint", {
+    enum: ["afr", "apac", "apac-ne", "apac-se", "eeur", "enam", "me", "oc", "sam", "weur", "wnam"],
+  }),
 });
 
 export const channelState = sqliteTable("channel_state", {
@@ -105,6 +109,10 @@ export const fanoutMetadata = sqliteTable("fanout_metadata", {
   appId: text("app_id").notNull(),
   channel: text("channel").notNull(),
   branchName: text("branch_name").notNull(),
+  jurisdiction: text("jurisdiction", { enum: ["eu", "fedramp", "fedramp-high", "us"] }),
+  locationHint: text("location_hint", {
+    enum: ["afr", "apac", "apac-ne", "apac-se", "eeur", "enam", "me", "oc", "sam", "weur", "wnam"],
+  }),
 });
 
 export const fanoutState = sqliteTable("fanout_state", {
@@ -129,4 +137,14 @@ export const userGateways = sqliteTable("user_gateways", {
   gatewayName: text("gateway_name").primaryKey(),
   connectionCount: integer("connection_count").notNull(),
   generation: integer("generation").notNull(),
+});
+
+export const userMetadata = sqliteTable("user_metadata", {
+  singleton: integer("singleton").primaryKey(),
+  appId: text("app_id").notNull(),
+  userId: text("user_id").notNull(),
+  jurisdiction: text("jurisdiction", { enum: ["eu", "fedramp", "fedramp-high", "us"] }),
+  locationHint: text("location_hint", {
+    enum: ["afr", "apac", "apac-ne", "apac-se", "eeur", "enam", "me", "oc", "sam", "weur", "wnam"],
+  }),
 });

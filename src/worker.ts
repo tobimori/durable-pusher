@@ -1,10 +1,15 @@
+import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Headers from "effect/unstable/http/Headers";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import {
+  AppRegistry,
   ChannelDirectoryShard,
   ChannelShard,
   ConnectionShard,
@@ -12,15 +17,21 @@ import {
   UserShard,
 } from "./actors/contracts.ts";
 import { HttpActorDependencies } from "./actors/dependencies.ts";
+import { makePlacedNamespace } from "./actors/placement.ts";
+import {
+  ApplicationBootstrap,
+  type ApplicationPlacement,
+  RuntimeApplication,
+} from "./apps/model.ts";
 import { AppConfig, AppConfigLive } from "./config.ts";
 import { WorkerNames, WorkerNamesLive } from "./hosts/names.ts";
 import { makePusherHttp } from "./pusher/http.ts";
+import { ApiError } from "./pusher/protocol.ts";
 import { randomConnectionShardName } from "./sharding.ts";
 
 export { PusherWorker };
 
 const HealthResponse = Schema.Struct({
-  app_id: Schema.String,
   effect: Schema.String,
   service: Schema.String,
   status: Schema.String,
@@ -31,6 +42,18 @@ const RESPONSE_HEADERS = {
   "access-control-allow-origin": "*",
   "cache-control": "no-store",
 };
+
+const apiError = (status: number, message: string): ApiError => ApiError.make({ message, status });
+
+const actorApiError = Effect.mapError((error: { readonly message: string }) =>
+  apiError(503, error.message),
+);
+
+const placementOf = (application: RuntimeApplication): ApplicationPlacement => ({
+  appId: application.appId,
+  jurisdiction: application.jurisdiction,
+  locationHint: application.locationHint,
+});
 
 export const PusherWorkerLive = PusherWorker.make(
   Effect.gen(function* () {
@@ -59,16 +82,34 @@ export const PusherWorkerLive = PusherWorker.make(
   }),
   Effect.gen(function* () {
     const names = yield* WorkerNames;
+    const environment = yield* Cloudflare.WorkerEnvironment;
+    const applications = yield* AppRegistry.from(names.registry);
     const connections = yield* ConnectionShard.from(names.connection);
+    const placedConnections = makePlacedNamespace("ConnectionShard", connections, environment);
     const channels = yield* ChannelShard.from(names.channel);
     const directories = yield* ChannelDirectoryShard.from(names.directory);
     const users = yield* UserShard.from(names.user);
-    const httpDependencies = Layer.mergeAll(
-      Layer.succeed(HttpActorDependencies, { channels, directories, users }),
-      AppConfigLive,
-    );
+    const httpDependencies = Layer.succeed(HttpActorDependencies, {
+      applications,
+      channels: makePlacedNamespace("ChannelShard", channels, environment),
+      directories: makePlacedNamespace("ChannelDirectoryShard", directories, environment),
+      users: makePlacedNamespace("UserShard", users, environment),
+    });
     const http = yield* makePusherHttp.pipe(Effect.provide(httpDependencies));
     const config = yield* AppConfig;
+    const bootstrapInput = yield* Schema.encodeEffect(ApplicationBootstrap)({
+      appId: config.appId,
+      appKey: config.appKey,
+      appSecret: Redacted.value(config.appSecret),
+      authToken: Redacted.value(config.authToken),
+      encryptionMasterKey: Redacted.value(config.encryptionMasterKey),
+      jurisdiction: Option.none(),
+      locationHint: Option.none(),
+      name: "Bootstrap application",
+    }).pipe(Effect.orDie);
+    const bootstrapApplication = Effect.fn("PusherWorker.bootstrapApplication")(function* () {
+      yield* applications.getByName("applications").bootstrap(bootstrapInput);
+    }, actorApiError);
 
     const route = Effect.fn("PusherWorker.route")(function* (
       request: HttpServerRequest.HttpServerRequest,
@@ -88,7 +129,6 @@ export const PusherWorkerLive = PusherWorker.make(
       if (request.method === "GET" && pathname === "/health") {
         return yield* encodeHealthResponse(
           {
-            app_id: config.appId,
             effect: "4.0.0-rc.111",
             service: "durable-pusher",
             status: "ok",
@@ -96,13 +136,34 @@ export const PusherWorkerLive = PusherWorker.make(
           { headers: RESPONSE_HEADERS },
         );
       }
+      yield* bootstrapApplication();
 
       if (
         request.method === "GET" &&
         request.headers.upgrade?.toLowerCase() === "websocket" &&
         /\/app\/[^/]+$/.test(pathname)
       ) {
-        const shardName = yield* randomConnectionShardName(config.appId);
+        const keyResult = yield* Schema.decodeEffect(Schema.StringFromUriComponent)(
+          pathname.slice(5),
+        ).pipe(Effect.result);
+        const encodedApplication = Result.isSuccess(keyResult)
+          ? Option.fromNullishOr(
+              yield* applications
+                .getByName("applications")
+                .resolveByKey(keyResult.success)
+                .pipe(actorApiError),
+            )
+          : Option.none();
+        const application = Option.isSome(encodedApplication)
+          ? Option.some(
+              yield* Schema.decodeEffect(RuntimeApplication)(encodedApplication.value).pipe(
+                actorApiError,
+              ),
+            )
+          : Option.none();
+        const shardName = Option.isSome(application)
+          ? yield* randomConnectionShardName(application.value.appId)
+          : "invalid:connection:0";
         const source = request.source;
         if (!(source instanceof Request)) {
           return HttpServerResponse.text("WebSocket request source is unavailable", {
@@ -112,15 +173,16 @@ export const PusherWorkerLive = PusherWorker.make(
         const routedRequest = yield* Effect.sync(() =>
           HttpServerRequest.fromWeb(
             new Request(source, {
-              headers: Headers.set(
-                request.headers,
-                "x-durable-pusher-connection-shard",
-                shardName,
-              ),
+              headers: Headers.set(request.headers, "x-durable-pusher-connection-shard", shardName),
             }),
           ),
         );
-        return yield* connections.getByName(shardName).fetch(routedRequest);
+        const connection = Option.isSome(application)
+          ? yield* placedConnections
+              .getByName(shardName, placementOf(application.value))
+              .pipe(actorApiError)
+          : connections.getByName(shardName);
+        return yield* connection.fetch(routedRequest).pipe(actorApiError);
       }
       return yield* http.handle(request);
     });

@@ -1,12 +1,12 @@
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
-import * as Redacted from "effect/Redacted";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as UrlParams from "effect/unstable/http/UrlParams";
 import { HttpActorDependencies } from "../actors/dependencies.ts";
-import { AppConfig } from "../config.ts";
+import { ApplicationPlacement, RuntimeApplication } from "../apps/model.ts";
 import { DIRECTORY_SHARD_COUNT, channelShardName, userShardName } from "../sharding.ts";
 import {
   channelAuthorization,
@@ -109,14 +109,24 @@ export const apiErrorResponse = Effect.fn("PusherHttp.apiErrorResponse")(functio
 });
 
 const required = Effect.fn("PusherHttp.required")(function* (
-  value: string | null,
+  value: Option.Option<string>,
   message: string,
 ) {
-  if (value === null) {
+  if (Option.isNone(value)) {
     return yield* apiError(400, message);
   }
-  return value;
+  return value.value;
 });
+
+const placementOf = (application: RuntimeApplication): ApplicationPlacement => ({
+  appId: application.appId,
+  jurisdiction: application.jurisdiction,
+  locationHint: application.locationHint,
+});
+
+const actorApiError = Effect.mapError((error: { readonly message: string }) =>
+  apiError(503, error.message),
+);
 
 const decodeJsonBody = Effect.fn("PusherHttp.decodeJsonBody")(function* <
   S extends Schema.Constraint,
@@ -183,8 +193,8 @@ const canonicalQuery = Effect.fn("PusherHttp.canonicalQuery")(function* (url: Pa
 });
 
 export const makePusherHttp = Effect.gen(function* () {
-  const config = yield* AppConfig;
   const {
+    applications,
     channels: channelShards,
     directories: directoryShards,
     users: userShards,
@@ -195,21 +205,30 @@ export const makePusherHttp = Effect.gen(function* () {
     url: ParsedUrl,
     body: Uint8Array,
   ) {
-    const appKey = url.searchParams.get("auth_key");
+    const appKey = yield* required(
+      Option.fromNullishOr(url.searchParams.get("auth_key")),
+      "Missing authentication key",
+    );
     const timestampText = yield* required(
-      url.searchParams.get("auth_timestamp"),
+      Option.fromNullishOr(url.searchParams.get("auth_timestamp")),
       "Missing authentication timestamp",
     );
-    const version = url.searchParams.get("auth_version");
+    const version = Option.fromNullishOr(url.searchParams.get("auth_version"));
     const signature = yield* required(
-      url.searchParams.get("auth_signature"),
+      Option.fromNullishOr(url.searchParams.get("auth_signature")),
       "Missing authentication signature",
     );
 
-    if (appKey !== config.appKey) {
+    const encodedApplication = Option.fromNullishOr(
+      yield* applications.getByName("applications").resolveByKey(appKey).pipe(actorApiError),
+    );
+    if (Option.isNone(encodedApplication)) {
       return yield* apiError(401, "Missing or invalid authentication parameters");
     }
-    if (version !== "1.0") {
+    const application = yield* Schema.decodeEffect(RuntimeApplication)(
+      encodedApplication.value,
+    ).pipe(actorApiError);
+    if (!Option.contains(version, "1.0")) {
       return yield* apiError(401, "Unsupported authentication version");
     }
 
@@ -223,23 +242,25 @@ export const makePusherHttp = Effect.gen(function* () {
       return yield* apiError(401, "Authentication timestamp is outside the accepted window");
     }
 
-    const bodyMd5 = url.searchParams.get("body_md5");
-    if (body.byteLength > 0 && bodyMd5 === null) {
+    const bodyMd5 = Option.fromNullishOr(url.searchParams.get("body_md5"));
+    if (body.byteLength > 0 && Option.isNone(bodyMd5)) {
       return yield* apiError(401, "body_md5 is required for requests with a body");
     }
-    if (bodyMd5 !== null && !timingSafeEqual(bodyMd5, md5Hex(body))) {
+    if (Option.isSome(bodyMd5) && !timingSafeEqual(bodyMd5.value, md5Hex(body))) {
       return yield* apiError(401, "body_md5 does not match the request body");
     }
 
     const stringToSign = `${request.method}\n${url.pathname}\n${yield* canonicalQuery(url)}`;
-    if (
-      !timingSafeEqual(signature, hmacSha256Hex(Redacted.value(config.appSecret), stringToSign))
-    ) {
+    if (!timingSafeEqual(signature, hmacSha256Hex(application.appSecret, stringToSign))) {
       return yield* apiError(401, "Invalid authentication signature");
     }
+    return application;
   });
 
-  const publishOne = Effect.fn("PusherHttp.publishOne")(function* (event: typeof BatchEvent.Type) {
+  const publishOne = Effect.fn("PusherHttp.publishOne")(function* (
+    application: RuntimeApplication,
+    event: typeof BatchEvent.Type,
+  ) {
     if (!validPublishedChannel(event.channel)) {
       return yield* apiError(400, `Invalid channel name: ${event.channel}`);
     }
@@ -253,10 +274,16 @@ export const makePusherHttp = Effect.gen(function* () {
       return yield* apiError(400, "Invalid socket_id");
     }
 
-    const result = yield* channelShards
-      .getByName(channelShardName(config.appId, event.channel))
-      .publish(
-        config.appId,
+    const placement = placementOf(application);
+    const encodedPlacement =
+      yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
+    const result = yield* Effect.gen(function* () {
+      const channel = yield* channelShards.getByName(
+        channelShardName(application.appId, event.channel),
+        placement,
+      );
+      return yield* channel.publish(
+        encodedPlacement,
         event.channel,
         event.name,
         event.data,
@@ -264,10 +291,14 @@ export const makePusherHttp = Effect.gen(function* () {
         null,
         true,
       );
+    }).pipe(actorApiError);
     return infoAttributes(event.info, result);
   });
 
-  const postEvents = Effect.fn("PusherHttp.postEvents")(function* (body: Uint8Array) {
+  const postEvents = Effect.fn("PusherHttp.postEvents")(function* (
+    application: RuntimeApplication,
+    body: Uint8Array,
+  ) {
     const event = yield* decodeJsonBody(SingleEvent, body);
     if ((event.channel === undefined) === (event.channels === undefined)) {
       return yield* apiError(400, "Supply exactly one of channel or channels");
@@ -284,7 +315,7 @@ export const makePusherHttp = Effect.gen(function* () {
     }
 
     const results = yield* Effect.forEach(channels, (channel) =>
-      publishOne({
+      publishOne(application, {
         channel,
         data: event.data,
         name: event.name,
@@ -302,19 +333,27 @@ export const makePusherHttp = Effect.gen(function* () {
     });
   });
 
-  const postBatch = Effect.fn("PusherHttp.postBatch")(function* (body: Uint8Array) {
+  const postBatch = Effect.fn("PusherHttp.postBatch")(function* (
+    application: RuntimeApplication,
+    body: Uint8Array,
+  ) {
     const request = yield* decodeJsonBody(Batch, body);
     if (request.batch.length === 0 || request.batch.length > 10) {
       return yield* apiError(400, "A batch must contain between 1 and 10 events");
     }
-    const attributes = yield* Effect.forEach(request.batch, publishOne);
+    const attributes = yield* Effect.forEach(request.batch, (event) =>
+      publishOne(application, event),
+    );
     if (request.batch.some((event) => event.info !== undefined)) {
       return yield* json({ batch: attributes });
     }
     return yield* json({});
   });
 
-  const listChannels = Effect.fn("PusherHttp.listChannels")(function* (url: ParsedUrl) {
+  const listChannels = Effect.fn("PusherHttp.listChannels")(function* (
+    application: RuntimeApplication,
+    url: ParsedUrl,
+  ) {
     const prefix = url.searchParams.get("filter_by_prefix");
     const info = url.searchParams.get("info") ?? undefined;
     const fields = new Set(info?.split(",") ?? []);
@@ -324,9 +363,15 @@ export const makePusherHttp = Effect.gen(function* () {
 
     const results = yield* Effect.forEach(
       Array.from({ length: DIRECTORY_SHARD_COUNT }, (_, shard) => shard),
-      (shard) => directoryShards.getByName(`${config.appId}:directory:${shard}`).list(prefix),
+      Effect.fn("PusherHttp.listChannels.shard")(function* (shard) {
+        const directory = yield* directoryShards.getByName(
+          `${application.appId}:directory:${shard}`,
+          placementOf(application),
+        );
+        return yield* directory.list(prefix);
+      }),
       { concurrency: 8 },
-    );
+    ).pipe(actorApiError);
     const entries = results
       .flat()
       .sort((left, right) =>
@@ -347,6 +392,7 @@ export const makePusherHttp = Effect.gen(function* () {
   });
 
   const getChannelInfo = Effect.fn("PusherHttp.getChannelInfo")(function* (
+    application: RuntimeApplication,
     channel: string,
     url: ParsedUrl,
   ) {
@@ -362,22 +408,50 @@ export const makePusherHttp = Effect.gen(function* () {
     if (requestedFields.has("subscription_count") && channelType.kind === "presence") {
       return yield* apiError(400, "subscription_count is unavailable for presence channels");
     }
-    const info = yield* channelShards.getByName(channelShardName(config.appId, channel)).info();
+    const placement = placementOf(application);
+    const encodedPlacement =
+      yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
+    const info = yield* Effect.gen(function* () {
+      const channelShard = yield* channelShards.getByName(
+        channelShardName(application.appId, channel),
+        placement,
+      );
+      return yield* channelShard.info(encodedPlacement, channel);
+    }).pipe(actorApiError);
     return yield* json({ occupied: info.occupied, ...infoAttributes(fields, info) });
   });
 
-  const getPresenceUsers = Effect.fn("PusherHttp.getPresenceUsers")(function* (channel: string) {
+  const getPresenceUsers = Effect.fn("PusherHttp.getPresenceUsers")(function* (
+    application: RuntimeApplication,
+    channel: string,
+  ) {
     if (classifyChannel(channel).kind !== "presence" || !isValidChannelName(channel)) {
       return yield* apiError(400, "Users are available only for presence channels");
     }
-    const users = yield* channelShards
-      .getByName(channelShardName(config.appId, channel))
-      .presenceUsers();
+    const placement = placementOf(application);
+    const encodedPlacement =
+      yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
+    const users = yield* Effect.gen(function* () {
+      const channelShard = yield* channelShards.getByName(
+        channelShardName(application.appId, channel),
+        placement,
+      );
+      return yield* channelShard.presenceUsers(encodedPlacement, channel);
+    }).pipe(actorApiError);
     return yield* json({ users: users.map((id) => ({ id })) });
   });
 
-  const terminateUser = Effect.fn("PusherHttp.terminateUser")(function* (userId: string) {
-    yield* userShards.getByName(userShardName(config.appId, userId)).terminate(userId);
+  const terminateUser = Effect.fn("PusherHttp.terminateUser")(function* (
+    application: RuntimeApplication,
+    userId: string,
+  ) {
+    const placement = placementOf(application);
+    const encodedPlacement =
+      yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
+    yield* Effect.gen(function* () {
+      const user = yield* userShards.getByName(userShardName(application.appId, userId), placement);
+      yield* user.terminate(encodedPlacement, userId);
+    }).pipe(actorApiError);
     return yield* json({});
   });
 
@@ -387,11 +461,11 @@ export const makePusherHttp = Effect.gen(function* () {
   ) {
     const buffer = yield* request.arrayBuffer;
     const body = yield* Effect.sync(() => new Uint8Array(buffer));
-    yield* authenticateRestRequest(request, url, body);
+    const application = yield* authenticateRestRequest(request, url, body);
 
     const legacyTerminateMatch = /^\/users\/([^/]+)\/terminate_connections$/.exec(url.pathname);
     if (request.method === "POST" && legacyTerminateMatch?.[1] !== undefined) {
-      return yield* terminateUser(yield* decodePathSegment(legacyTerminateMatch[1]));
+      return yield* terminateUser(application, yield* decodePathSegment(legacyTerminateMatch[1]));
     }
 
     const appMatch = /^\/apps\/([^/]+)(\/.*)?$/.exec(url.pathname);
@@ -399,32 +473,32 @@ export const makePusherHttp = Effect.gen(function* () {
       return yield* apiError(401, "Unknown app id");
     }
     const appId = yield* decodePathSegment(appMatch[1]);
-    if (appId !== config.appId) {
+    if (appId !== application.appId) {
       return yield* apiError(401, "Unknown app id");
     }
     const suffix = appMatch[2] ?? "";
 
     if (request.method === "POST" && suffix === "/events") {
-      return yield* postEvents(body);
+      return yield* postEvents(application, body);
     }
     if (request.method === "POST" && suffix === "/batch_events") {
-      return yield* postBatch(body);
+      return yield* postBatch(application, body);
     }
     if (request.method === "GET" && suffix === "/channels") {
-      return yield* listChannels(url);
+      return yield* listChannels(application, url);
     }
 
     const usersMatch = /^\/channels\/([^/]+)\/users$/.exec(suffix);
     if (request.method === "GET" && usersMatch?.[1] !== undefined) {
-      return yield* getPresenceUsers(yield* decodePathSegment(usersMatch[1]));
+      return yield* getPresenceUsers(application, yield* decodePathSegment(usersMatch[1]));
     }
     const channelMatch = /^\/channels\/([^/]+)$/.exec(suffix);
     if (request.method === "GET" && channelMatch?.[1] !== undefined) {
-      return yield* getChannelInfo(yield* decodePathSegment(channelMatch[1]), url);
+      return yield* getChannelInfo(application, yield* decodePathSegment(channelMatch[1]), url);
     }
     const terminateMatch = /^\/users\/([^/]+)\/terminate_connections$/.exec(suffix);
     if (request.method === "POST" && terminateMatch?.[1] !== undefined) {
-      return yield* terminateUser(yield* decodePathSegment(terminateMatch[1]));
+      return yield* terminateUser(application, yield* decodePathSegment(terminateMatch[1]));
     }
     return yield* apiError(404, "Pusher API endpoint not found");
   });
@@ -432,19 +506,32 @@ export const makePusherHttp = Effect.gen(function* () {
   const requireAuthorizationToken = Effect.fn("PusherHttp.requireAuthorizationToken")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
-    const authorization = request.headers.authorization;
+    const authorization = Option.fromNullishOr(request.headers.authorization);
     if (
-      authorization === undefined ||
-      !timingSafeEqual(authorization, `Bearer ${Redacted.value(config.authToken)}`)
+      Option.isNone(authorization) ||
+      !authorization.value.startsWith("Bearer ") ||
+      authorization.value.length === 7
     ) {
       return yield* apiError(403, "Authorization denied");
     }
+    const encodedApplication = Option.fromNullishOr(
+      yield* applications
+        .getByName("applications")
+        .resolveByAuthToken(authorization.value.slice(7))
+        .pipe(actorApiError),
+    );
+    if (Option.isNone(encodedApplication)) {
+      return yield* apiError(403, "Authorization denied");
+    }
+    return yield* Schema.decodeEffect(RuntimeApplication)(encodedApplication.value).pipe(
+      actorApiError,
+    );
   });
 
   const handleChannelAuthorization = Effect.fn("PusherHttp.handleChannelAuthorization")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
-    yield* requireAuthorizationToken(request);
+    const application = yield* requireAuthorizationToken(request);
     const params = yield* decodeChannelAuthorizationForm(yield* readFormRecord(request)).pipe(
       Effect.mapError(() => apiError(400, "Request body does not match the authorization API")),
     );
@@ -481,8 +568,8 @@ export const makePusherHttp = Effect.gen(function* () {
 
     const response: JsonObject = {
       auth: channelAuthorization(
-        config.appKey,
-        Redacted.value(config.appSecret),
+        application.appKey,
+        application.appSecret,
         params.socket_id,
         params.channel_name,
         channelData,
@@ -490,9 +577,9 @@ export const makePusherHttp = Effect.gen(function* () {
       ...(channelData === undefined ? {} : { channel_data: channelData }),
     };
     if (channelType.kind === "encrypted") {
-      const masterKey = yield* decodeEncryptionMasterKey(
-        Redacted.value(config.encryptionMasterKey),
-      ).pipe(Effect.mapError(() => apiError(503, "Encrypted channels are not configured")));
+      const masterKey = yield* decodeEncryptionMasterKey(application.encryptionMasterKey).pipe(
+        Effect.mapError(() => apiError(503, "Encrypted channels are not configured")),
+      );
       response.shared_secret = yield* encryptedChannelSharedSecret(
         params.channel_name,
         masterKey,
@@ -504,7 +591,7 @@ export const makePusherHttp = Effect.gen(function* () {
   const handleUserAuthorization = Effect.fn("PusherHttp.handleUserAuthorization")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
-    yield* requireAuthorizationToken(request);
+    const application = yield* requireAuthorizationToken(request);
     const params = yield* decodeUserAuthorizationForm(yield* readFormRecord(request)).pipe(
       Effect.mapError(() => apiError(400, "Request body does not match the authorization API")),
     );
@@ -516,8 +603,8 @@ export const makePusherHttp = Effect.gen(function* () {
     );
     return yield* json({
       auth: userAuthentication(
-        config.appKey,
-        Redacted.value(config.appSecret),
+        application.appKey,
+        application.appSecret,
         params.socket_id,
         params.user_data,
       ),

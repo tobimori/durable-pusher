@@ -4,12 +4,13 @@ import { and, count, eq, lt, sql } from "drizzle-orm";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
-import * as Redacted from "effect/Redacted";
+import * as Equal from "effect/Equal";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
-import { AppConfig } from "../config.ts";
+import { ApplicationPlacement, RuntimeApplication } from "../apps/model.ts";
 import migrations from "../db/migrations.ts";
 import {
   channelVersions,
@@ -38,19 +39,18 @@ import {
   mapActorError,
   MAX_EVENT_DATA_BYTES,
   parseClientFrame,
+  PresenceJoin,
   pusherError,
   subscriptionCount,
   subscriptionSucceeded,
   toEventData,
   type JsonValue,
+  type DeliveryEncoded,
   type PresenceMember,
   type ServerEvent,
 } from "../pusher/protocol.ts";
 import { channelShardName, fanoutShardName, makeSocketId, userShardName } from "../sharding.ts";
-import {
-  ConnectionShard,
-  type ConnectionShardApi,
-} from "./contracts.ts";
+import { ConnectionShard, type ConnectionShardApi } from "./contracts.ts";
 import { ConnectionActorDependencies } from "./dependencies.ts";
 
 export { ConnectionShard };
@@ -82,11 +82,17 @@ const operationError = (operation: string) =>
 const rpcError = (operation: string) =>
   Effect.catchCause((cause) => Effect.fail(actorError(operation, Cause.pretty(cause))));
 
+const applicationPlacement = (application: ApplicationPlacement): ApplicationPlacement => ({
+  appId: application.appId,
+  jurisdiction: application.jurisdiction,
+  locationHint: application.locationHint,
+});
+
 export const ConnectionShardLive = ConnectionShard.make(
   Effect.gen(function* () {
-    const config = yield* AppConfig;
     const state = yield* Cloudflare.DurableObjectState;
     const {
+      applications,
       channels: channelShards,
       fanouts: fanoutShards,
       users: userShards,
@@ -96,6 +102,27 @@ export const ConnectionShardLive = ConnectionShard.make(
     // @effect-diagnostics-next-line returnEffectInGen:off
     return Effect.gen(function* () {
       const db = yield* Drizzle.DurableObject({ migrations });
+      const registry = applications.getByName("applications");
+
+      const activeApplication = Effect.fn("ConnectionShard.activeApplication")(function* (
+        placement: ApplicationPlacement,
+        operation: string,
+      ) {
+        const encoded = Option.fromNullishOr(yield* registry.resolveById(placement.appId));
+        if (Option.isNone(encoded)) {
+          return yield* failActor(operation, "Application is disabled or does not exist");
+        }
+        const application = yield* Schema.decodeEffect(RuntimeApplication)(encoded.value).pipe(
+          operationError(operation),
+        );
+        if (
+          !Equal.equals(application.jurisdiction, placement.jurisdiction) ||
+          !Equal.equals(application.locationHint, placement.locationHint)
+        ) {
+          return yield* failActor(operation, "Application is disabled or does not exist");
+        }
+        return application;
+      });
 
       const decodeAttachment = Effect.fn("ConnectionShard.decodeAttachment")(function* (
         socket: Cloudflare.WebSocket,
@@ -168,11 +195,11 @@ export const ConnectionShardLive = ConnectionShard.make(
 
       const rejectConnection = Effect.fn("ConnectionShard.rejectConnection")(function* (
         socket: Cloudflare.WebSocket,
-        protocol: number | undefined,
+        protocol: Option.Option<number>,
         code: number,
         message: string,
       ) {
-        if (protocol === 5) {
+        if (Option.contains(protocol, 5)) {
           yield* sendNative(socket, pusherError(message, code), "rejectConnection");
         }
         yield* closeNative(socket, code, message, "rejectConnection");
@@ -265,25 +292,24 @@ export const ConnectionShardLive = ConnectionShard.make(
       }, operationError("bumpUserGeneration"));
 
       const syncChannel = Effect.fn("ConnectionShard.syncChannel")(function* (
-        appId: string,
+        placement: ApplicationPlacement,
         channel: string,
         gateway: string,
       ) {
-        const branch = fanoutShardName(appId, channel, gateway);
-        return yield* fanoutShards
-          .getByName(branch)
-          .setGateway(
-            appId,
-            channel,
-            branch,
-            gateway,
-            yield* channelSubscriptionCount(channel),
-            yield* bumpChannelGeneration(channel),
-          );
+        const branch = fanoutShardName(placement.appId, channel, gateway);
+        const fanout = yield* fanoutShards.getByName(branch, placement);
+        return yield* fanout.setGateway(
+          yield* Schema.encodeEffect(ApplicationPlacement)(placement),
+          channel,
+          branch,
+          gateway,
+          yield* channelSubscriptionCount(channel),
+          yield* bumpChannelGeneration(channel),
+        );
       }, operationError("syncChannel"));
 
       const syncUser = Effect.fn("ConnectionShard.syncUser")(function* (
-        appId: string,
+        placement: ApplicationPlacement,
         userId: string,
         gateway: string,
       ) {
@@ -291,9 +317,20 @@ export const ConnectionShardLive = ConnectionShard.make(
           .select({ value: count() })
           .from(connections)
           .where(eq(connections.userId, userId));
-        yield* userShards
-          .getByName(userShardName(appId, userId))
-          .setGateway(gateway, rows[0]?.value ?? 0, yield* bumpUserGeneration(userId));
+        const connectionCount = Option.fromNullishOr(rows[0]).pipe(
+          Option.match({
+            onNone: () => 0,
+            onSome: (row) => row.value,
+          }),
+        );
+        const user = yield* userShards.getByName(userShardName(placement.appId, userId), placement);
+        yield* user.setGateway(
+          yield* Schema.encodeEffect(ApplicationPlacement)(placement),
+          userId,
+          gateway,
+          connectionCount,
+          yield* bumpUserGeneration(userId),
+        );
       }, operationError("syncUser"));
 
       const presenceSubscriptionData = Effect.fn("ConnectionShard.presenceSubscriptionData")(
@@ -362,6 +399,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         rawData: JsonValue | undefined,
       ) {
         const attachment = yield* decodeAttachment(socket, "subscribe");
+        const application = yield* activeApplication(attachment, "subscribe");
         const data = yield* decodeSubscribeData(rawData);
         const channel = data.channel;
         const serverToUser = isServerToUserChannel(channel);
@@ -391,8 +429,8 @@ export const ConnectionShardLive = ConnectionShard.make(
               if (
                 !verifyChannelAuthorization(
                   authorization,
-                  config.appKey,
-                  Redacted.value(config.appSecret),
+                  application.appKey,
+                  application.appSecret,
                   attachment.socketId,
                   channel,
                   data.channel_data,
@@ -409,8 +447,8 @@ export const ConnectionShardLive = ConnectionShard.make(
                 signedIn.userData === null ||
                 !verifyChannelAuthorization(
                   authorization,
-                  config.appKey,
-                  Redacted.value(config.appSecret),
+                  application.appKey,
+                  application.appSecret,
                   attachment.socketId,
                   channel,
                 )
@@ -429,8 +467,8 @@ export const ConnectionShardLive = ConnectionShard.make(
           } else if (
             !verifyChannelAuthorization(
               authorization,
-              config.appKey,
-              Redacted.value(config.appSecret),
+              application.appKey,
+              application.appSecret,
               attachment.socketId,
               channel,
             )
@@ -467,7 +505,8 @@ export const ConnectionShardLive = ConnectionShard.make(
             },
           });
 
-        const snapshot = yield* syncChannel(attachment.appId, channel, attachment.shardName).pipe(
+        const placement = applicationPlacement(attachment);
+        const snapshot = yield* syncChannel(placement, channel, attachment.shardName).pipe(
           Effect.catch(
             Effect.fn("ConnectionShard.subscribe.rollback")(function* (error) {
               yield* db
@@ -494,16 +533,22 @@ export const ConnectionShardLive = ConnectionShard.make(
         let barrier = snapshot.barrier;
         let presenceMembers: ReadonlyArray<PresenceMember> | undefined;
         if (presence !== undefined) {
-          const joined = yield* channelShards
-            .getByName(channelShardName(attachment.appId, channel))
-            .joinPresence({
+          const channelShard = yield* channelShards.getByName(
+            channelShardName(attachment.appId, channel),
+            placement,
+          );
+          const joined = yield* channelShard.joinPresence(
+            yield* Schema.encodeEffect(PresenceJoin)({
               appId: attachment.appId,
               branchName,
               channel,
+              jurisdiction: attachment.jurisdiction,
+              locationHint: attachment.locationHint,
               socketId: attachment.socketId,
               userId: presence.userId,
               userInfo: presence.userInfo,
-            });
+            }),
+          );
           if (joined.barrier > barrier) {
             barrier = joined.barrier;
           }
@@ -526,7 +571,6 @@ export const ConnectionShardLive = ConnectionShard.make(
 
         const successData =
           presenceMembers === undefined ? "{}" : yield* presenceSubscriptionData(presenceMembers);
-        yield* send(socket, subscriptionSucceeded(channel, successData));
         yield* db
           .update(subscriptions)
           .set({
@@ -540,6 +584,7 @@ export const ConnectionShardLive = ConnectionShard.make(
               eq(subscriptions.channel, channel),
             ),
           );
+        yield* send(socket, subscriptionSucceeded(channel, successData));
         yield* flushPending(attachment.socketId, channel);
 
         if (channelType.kind !== "presence") {
@@ -581,16 +626,25 @@ export const ConnectionShardLive = ConnectionShard.make(
         );
 
         const fanoutResult = yield* syncChannel(
-          attachment.appId,
+          applicationPlacement(attachment),
           data.channel,
           attachment.shardName,
         ).pipe(Effect.result);
         const presenceResult =
           current.kind === "presence"
-            ? yield* channelShards
-                .getByName(channelShardName(attachment.appId, data.channel))
-                .leavePresence(attachment.appId, data.channel, attachment.socketId)
-                .pipe(Effect.result)
+            ? yield* Effect.gen(function* () {
+                const channelShard = yield* channelShards.getByName(
+                  channelShardName(attachment.appId, data.channel),
+                  applicationPlacement(attachment),
+                );
+                yield* channelShard.leavePresence(
+                  yield* Schema.encodeEffect(ApplicationPlacement)(
+                    applicationPlacement(attachment),
+                  ),
+                  data.channel,
+                  attachment.socketId,
+                );
+              }).pipe(Effect.result)
             : Result.succeed(undefined);
         if (Result.isFailure(fanoutResult)) {
           return yield* fanoutResult.failure;
@@ -605,12 +659,13 @@ export const ConnectionShardLive = ConnectionShard.make(
         rawData: JsonValue | undefined,
       ) {
         const attachment = yield* decodeAttachment(socket, "signin");
+        const application = yield* activeApplication(attachment, "signin");
         const data = yield* decodeSigninData(rawData);
         if (
           !verifyUserAuthentication(
             data.auth,
-            config.appKey,
-            Redacted.value(config.appSecret),
+            application.appKey,
+            application.appSecret,
             attachment.socketId,
             data.user_data,
           )
@@ -633,7 +688,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         socket.serializeAttachment(
           yield* encodeAttachment({ ...attachment, userId: user.id }, "signin"),
         );
-        yield* syncUser(attachment.appId, user.id, attachment.shardName);
+        yield* syncUser(applicationPlacement(attachment), user.id, attachment.shardName);
         yield* send(socket, {
           data: yield* encodeJson({ user_data: data.user_data }),
           event: "pusher:signin_success",
@@ -682,6 +737,7 @@ export const ConnectionShardLive = ConnectionShard.make(
           return yield* failActor("clientEvent", "Client event requires a channel");
         }
         const attachment = yield* decodeAttachment(socket, "clientEvent");
+        yield* activeApplication(attachment, "clientEvent");
         const current = yield* subscription(attachment.socketId, channel);
         if (
           current?.state !== "active" ||
@@ -699,17 +755,39 @@ export const ConnectionShardLive = ConnectionShard.make(
           return yield* failActor("clientEvent", "Client event data exceeds 10 KB");
         }
 
-        yield* channelShards
-          .getByName(channelShardName(attachment.appId, channel))
-          .publish(
-            attachment.appId,
-            channel,
-            event,
-            eventData,
-            attachment.socketId,
-            current.kind === "presence" ? current.userId : null,
-            false,
-          );
+        const channelShard = yield* channelShards.getByName(
+          channelShardName(attachment.appId, channel),
+          applicationPlacement(attachment),
+        );
+        const encodedPlacement = yield* Schema.encodeEffect(ApplicationPlacement)(
+          applicationPlacement(attachment),
+        );
+        yield* state.waitUntil(
+          channelShard
+            .publish(
+              encodedPlacement,
+              channel,
+              event,
+              eventData,
+              attachment.socketId,
+              current.kind === "presence" ? current.userId : null,
+              false,
+            )
+            .pipe(
+              Effect.catch(
+                Effect.fn("ConnectionShard.clientEvent.publishError")(function* (error) {
+                  yield* Effect.logWarning("Client event publication failed").pipe(
+                    Effect.annotateLogs({
+                      actor: error.actor,
+                      channel,
+                      message: error.message,
+                      operation: error.operation,
+                    }),
+                  );
+                }),
+              ),
+            ),
+        );
       }, operationError("clientEvent"));
 
       const cleanup = Effect.fn("ConnectionShard.cleanup")(function* (attachment: Attachment) {
@@ -730,7 +808,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         const failures: ActorError[] = [];
         for (const localSubscription of localSubscriptions) {
           const fanoutResult = yield* syncChannel(
-            attachment.appId,
+            applicationPlacement(attachment),
             localSubscription.channel,
             attachment.shardName,
           ).pipe(Effect.result);
@@ -738,10 +816,17 @@ export const ConnectionShardLive = ConnectionShard.make(
             failures.push(fanoutResult.failure);
           }
           if (localSubscription.kind === "presence") {
-            const presenceResult = yield* channelShards
-              .getByName(channelShardName(attachment.appId, localSubscription.channel))
-              .leavePresence(attachment.appId, localSubscription.channel, attachment.socketId)
-              .pipe(Effect.result);
+            const presenceResult = yield* Effect.gen(function* () {
+              const channelShard = yield* channelShards.getByName(
+                channelShardName(attachment.appId, localSubscription.channel),
+                applicationPlacement(attachment),
+              );
+              yield* channelShard.leavePresence(
+                yield* Schema.encodeEffect(ApplicationPlacement)(applicationPlacement(attachment)),
+                localSubscription.channel,
+                attachment.socketId,
+              );
+            }).pipe(operationError("cleanup"), Effect.result);
             if (Result.isFailure(presenceResult)) {
               failures.push(presenceResult.failure);
             }
@@ -749,7 +834,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         }
         if (currentConnection !== undefined && currentConnection.userId !== null) {
           const userResult = yield* syncUser(
-            attachment.appId,
+            applicationPlacement(attachment),
             currentConnection.userId,
             attachment.shardName,
           ).pipe(Effect.result);
@@ -767,12 +852,15 @@ export const ConnectionShardLive = ConnectionShard.make(
         socket: Cloudflare.WebSocket,
         protocol: number,
         shardName: string,
+        application: RuntimeApplication,
       ) {
         const socketId = yield* makeSocketId();
         const now = yield* Clock.currentTimeMillis;
         const attachment = yield* encodeAttachment(
           {
-            appId: config.appId,
+            appId: application.appId,
+            jurisdiction: application.jurisdiction,
+            locationHint: application.locationHint,
             protocol,
             shardName,
             socketId,
@@ -781,7 +869,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         );
         socket.serializeAttachment(attachment);
         yield* db.insert(connections).values({
-          appId: config.appId,
+          appId: application.appId,
           eventCount: 0,
           eventWindow: Math.floor(now / 1_000),
           protocol,
@@ -802,45 +890,56 @@ export const ConnectionShardLive = ConnectionShard.make(
         const [upgradeResponse, socket] = yield* Cloudflare.upgrade();
         const urlResult = yield* decodeUrl(request.originalUrl).pipe(Effect.result);
         if (Result.isFailure(urlResult)) {
-          yield* rejectConnection(socket, undefined, 4001, "Application does not exist");
+          yield* rejectConnection(socket, Option.none(), 4001, "Application does not exist");
           return upgradeResponse;
         }
 
-        const rawProtocol = urlResult.success.searchParams.get("protocol");
-        const protocolResult =
-          rawProtocol === null
-            ? undefined
-            : yield* decodeProtocolVersion(rawProtocol).pipe(Effect.result);
+        const rawProtocol = Option.fromNullishOr(urlResult.success.searchParams.get("protocol"));
+        const protocolResult = Option.isNone(rawProtocol)
+          ? Option.none()
+          : Option.some(yield* decodeProtocolVersion(rawProtocol.value).pipe(Effect.result));
         const pathResult = yield* decodeConnectionPath(urlResult.success.pathname).pipe(
           Effect.result,
         );
         const keyResult = Result.isSuccess(pathResult)
           ? yield* decodeAppKey(pathResult.success.slice(5)).pipe(Effect.result)
           : pathResult;
-        const protocol =
-          protocolResult !== undefined && Result.isSuccess(protocolResult)
-            ? protocolResult.success
-            : undefined;
+        const protocol = Option.flatMap(protocolResult, (result) =>
+          Result.isSuccess(result) ? Option.some(result.success) : Option.none(),
+        );
 
-        if (Result.isFailure(keyResult) || keyResult.success !== config.appKey) {
+        const encodedApplication = Result.isSuccess(keyResult)
+          ? Option.fromNullishOr(yield* registry.resolveByKey(keyResult.success))
+          : Option.none();
+        if (Option.isNone(encodedApplication)) {
           yield* rejectConnection(socket, protocol, 4001, "Application does not exist");
           return upgradeResponse;
         }
-        if (rawProtocol === null) {
-          yield* rejectConnection(socket, undefined, 4008, "Protocol version is required");
+        const application = yield* Schema.decodeEffect(RuntimeApplication)(
+          encodedApplication.value,
+        ).pipe(operationError("fetch"));
+        if (Option.isNone(rawProtocol)) {
+          yield* rejectConnection(socket, Option.none(), 4008, "Protocol version is required");
           return upgradeResponse;
         }
-        if (protocol === undefined) {
-          yield* rejectConnection(socket, undefined, 4007, "Unsupported protocol version");
+        if (Option.isNone(protocol)) {
+          yield* rejectConnection(socket, Option.none(), 4007, "Unsupported protocol version");
           return upgradeResponse;
         }
-        const shardName = request.headers["x-durable-pusher-connection-shard"];
-        if (shardName === undefined || shardName.length === 0) {
+        const shardName = Option.fromNullishOr(
+          request.headers["x-durable-pusher-connection-shard"],
+        );
+        if (
+          Option.isNone(shardName) ||
+          !shardName.value.startsWith(`${application.appId}:connection:`)
+        ) {
           yield* rejectConnection(socket, protocol, 4000, "Connection routing failed");
           return upgradeResponse;
         }
 
-        const connected = yield* connect(socket, protocol, shardName).pipe(Effect.result);
+        const connected = yield* connect(socket, protocol.value, shardName.value, application).pipe(
+          Effect.result,
+        );
         if (Result.isFailure(connected)) {
           yield* logNativeError("fetch", connected.failure);
           yield* sendNative(socket, pusherError(connected.failure.message), "fetch");
@@ -848,11 +947,12 @@ export const ConnectionShardLive = ConnectionShard.make(
           return upgradeResponse;
         }
 
-        const expectedProtocol = `pusher-channels-protocol-${protocol}`;
-        const requestedProtocols = request.headers["sec-websocket-protocol"]
-          ?.split(",")
-          .map((value) => value.trim());
-        return requestedProtocols?.includes(expectedProtocol) === true
+        const expectedProtocol = `pusher-channels-protocol-${protocol.value}`;
+        const requestedProtocols = Option.fromNullishOr(
+          request.headers["sec-websocket-protocol"],
+        ).pipe(Option.map((header) => header.split(",").map((value) => value.trim())));
+        return Option.isSome(requestedProtocols) &&
+          requestedProtocols.value.includes(expectedProtocol)
           ? HttpServerResponse.setHeader(
               upgradeResponse,
               "Sec-WebSocket-Protocol",
@@ -932,8 +1032,16 @@ export const ConnectionShardLive = ConnectionShard.make(
         yield* socket.close(code, reason);
       });
 
-      const deliver = Effect.fn("ConnectionShard.deliver")(function* (delivery: Delivery) {
+      const deliver = Effect.fn("ConnectionShard.deliver")(function* (delivery: DeliveryEncoded) {
         const decoded = yield* Schema.decodeEffect(Delivery)(delivery);
+        const [identityRow] = yield* db
+          .select({ appId: connections.appId })
+          .from(connections)
+          .limit(1);
+        const identity = Option.fromNullishOr(identityRow);
+        if (Option.isSome(identity) && identity.value.appId !== decoded.appId) {
+          return yield* failActor("deliver", "Connection shard application mismatch");
+        }
         const rows = yield* db
           .select({
             socketId: subscriptions.socketId,
@@ -991,11 +1099,14 @@ export const ConnectionShardLive = ConnectionShard.make(
         return yield* channelSubscriptionCount(decoded.channel);
       }, rpcError("deliver"));
 
-      const terminateUser = Effect.fn("ConnectionShard.terminateUser")(function* (userId: string) {
+      const terminateUser = Effect.fn("ConnectionShard.terminateUser")(function* (
+        appId: string,
+        userId: string,
+      ) {
         const rows = yield* db
           .select({ socketId: connections.socketId })
           .from(connections)
-          .where(eq(connections.userId, userId));
+          .where(and(eq(connections.appId, appId), eq(connections.userId, userId)));
         for (const row of rows) {
           const socket = yield* socketFor(row.socketId);
           if (socket !== undefined) {
