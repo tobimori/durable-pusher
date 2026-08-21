@@ -1,0 +1,11 @@
+.repos/
+node_modules/
+.alchemy/
+.wrangler/
+dist/
+coverage/
+*.log
+.dev.vars
+.env
+.env.*
+!.env.example
