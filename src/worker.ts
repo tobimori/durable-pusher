@@ -23,6 +23,7 @@ import {
   type ApplicationPlacement,
   RuntimeApplication,
 } from "./apps/model.ts";
+import { makeApplicationsHttp } from "./apps/http.ts";
 import { AppConfig, AppConfigLive } from "./config.ts";
 import { WorkerNames, WorkerNamesLive } from "./hosts/names.ts";
 import { makePusherHttp } from "./pusher/http.ts";
@@ -97,6 +98,7 @@ export const PusherWorkerLive = PusherWorker.make(
     });
     const http = yield* makePusherHttp.pipe(Effect.provide(httpDependencies));
     const config = yield* AppConfig;
+    const applicationsHttp = makeApplicationsHttp(applications, config.controlToken);
     const bootstrapInput = yield* Schema.encodeEffect(ApplicationBootstrap)({
       appId: config.appId,
       appKey: config.appKey,
@@ -107,9 +109,12 @@ export const PusherWorkerLive = PusherWorker.make(
       locationHint: Option.none(),
       name: "Bootstrap application",
     }).pipe(Effect.orDie);
-    const bootstrapApplication = Effect.fn("PusherWorker.bootstrapApplication")(function* () {
-      yield* applications.getByName("applications").bootstrap(bootstrapInput);
-    }, actorApiError);
+    const bootstrapApplication = Effect.fn("PusherWorker.bootstrapApplication")(
+      function* () {
+        yield* applications.getByName("applications").bootstrap(bootstrapInput);
+      },
+      Effect.mapError(() => apiError(503, "Application registry is unavailable")),
+    );
 
     const route = Effect.fn("PusherWorker.route")(function* (
       request: HttpServerRequest.HttpServerRequest,
@@ -119,7 +124,7 @@ export const PusherWorkerLive = PusherWorker.make(
         return HttpServerResponse.empty({
           headers: {
             "access-control-allow-headers": "Authorization, Content-Type, X-Pusher-Library",
-            "access-control-allow-methods": "GET, POST, OPTIONS",
+            "access-control-allow-methods": "DELETE, GET, OPTIONS, PATCH, POST",
             "access-control-allow-origin": "*",
             "cache-control": "no-store",
           },
@@ -137,6 +142,10 @@ export const PusherWorkerLive = PusherWorker.make(
         );
       }
       yield* bootstrapApplication();
+      if (pathname === "/control/v1/apps" || pathname.startsWith("/control/v1/apps/")) {
+        const url = yield* Schema.decodeEffect(Schema.URLFromString)(request.originalUrl);
+        return yield* applicationsHttp.handle(request, url);
+      }
 
       if (
         request.method === "GET" &&

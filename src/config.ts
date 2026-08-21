@@ -8,6 +8,7 @@ export interface AppConfigShape {
   readonly appKey: string;
   readonly appSecret: Redacted.Redacted<string>;
   readonly authToken: Redacted.Redacted<string>;
+  readonly controlToken: Redacted.Redacted<string>;
   readonly encryptionMasterKey: Redacted.Redacted<string>;
 }
 
@@ -20,6 +21,7 @@ export const AppConfigLive = Layer.effect(
     appKey: Config.string("PUSHER_APP_KEY"),
     appSecret: Config.redacted("PUSHER_APP_SECRET"),
     authToken: Config.redacted("PUSHER_AUTH_TOKEN"),
+    controlToken: Config.redacted("PUSHER_CONTROL_TOKEN"),
     encryptionMasterKey: Config.redacted("PUSHER_ENCRYPTION_MASTER_KEY").pipe(
       Config.withDefault(Redacted.make("")),
     ),

@@ -1,3 +1,4 @@
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 export const APP_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -31,7 +32,13 @@ export const ApplicationCreate = Schema.Struct({
 export const ApplicationPatch = Schema.Struct({
   enabled: Schema.OptionFromOptionalKey(Schema.Boolean),
   name: Schema.OptionFromOptionalKey(Schema.String.check(Schema.isLengthBetween(1, 100))),
-});
+}).check(
+  Schema.makeFilter((patch) =>
+    Option.isNone(patch.enabled) && Option.isNone(patch.name)
+      ? "Application patch must contain at least one field"
+      : undefined,
+  ),
+);
 
 export const ApplicationBootstrap = Schema.Struct({
   appId: AppId,

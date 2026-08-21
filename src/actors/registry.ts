@@ -80,6 +80,9 @@ export const AppRegistryLive = AppRegistry.make(
         const decoded = yield* Schema.decodeEffect(ApplicationCreate)(input).pipe(
           Effect.mapError(() => actorError("create", "Invalid application settings")),
         );
+        if (Option.isSome(decoded.appId) && Option.isSome(yield* rowById(decoded.appId.value))) {
+          return yield* actorError("create", "Application ID is not available");
+        }
         const appId = Option.isSome(decoded.appId) ? decoded.appId.value : yield* randomHex(8);
         const appKey = yield* randomHex(10);
         const appSecret = yield* randomHex(16);
@@ -125,44 +128,7 @@ export const AppRegistryLive = AppRegistry.make(
         );
         const existing = yield* rowById(decoded.appId);
         if (Option.isSome(existing)) {
-          const current = existing.value;
-          const authTokenHash = sha256Hex(decoded.authToken);
-          const jurisdiction = Option.getOrNull(decoded.jurisdiction);
-          const locationHint = Option.getOrNull(decoded.locationHint);
-          if (
-            current.appKey !== decoded.appKey ||
-            current.appSecret !== decoded.appSecret ||
-            current.authTokenHash !== authTokenHash ||
-            current.encryptionMasterKey !== decoded.encryptionMasterKey ||
-            current.jurisdiction !== jurisdiction ||
-            current.locationHint !== locationHint ||
-            current.name !== decoded.name ||
-            current.status !== "active"
-          ) {
-            const updatedAt = yield* Clock.currentTimeMillis;
-            yield* db
-              .update(applications)
-              .set({
-                appKey: decoded.appKey,
-                appSecret: decoded.appSecret,
-                authTokenHash,
-                encryptionMasterKey: decoded.encryptionMasterKey,
-                jurisdiction,
-                locationHint,
-                name: decoded.name,
-                status: "active",
-                updatedAt,
-              })
-              .where(eq(applications.appId, decoded.appId));
-            const updated = yield* rowById(decoded.appId);
-            if (Option.isNone(updated)) {
-              return yield* actorError("bootstrap", "Bootstrap update was not persisted");
-            }
-            return yield* encodeRuntimeApplication(toRuntime(updated.value)).pipe(
-              Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
-            );
-          }
-          return yield* encodeRuntimeApplication(toRuntime(current)).pipe(
+          return yield* encodeRuntimeApplication(toRuntime(existing.value)).pipe(
             Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
           );
         }

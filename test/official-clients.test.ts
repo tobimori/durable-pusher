@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import PusherServer from "pusher";
 import PusherClient from "pusher-js";
 import * as Effect from "effect/Effect";
-import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 const enabled = process.env.PUSHER_E2E === "1";
@@ -31,6 +31,10 @@ interface Bindable<A> {
   unbind(eventName: string, callback: (data: A) => void): void;
 }
 
+interface Triggerable extends Bindable<unknown> {
+  trigger(eventName: string, data: unknown): boolean;
+}
+
 const waitForEvent = Effect.fn("OfficialClients.waitForEvent")(<A = unknown>(
   bindable: Bindable<A>,
   eventName: string,
@@ -44,11 +48,71 @@ const waitForEvent = Effect.fn("OfficialClients.waitForEvent")(<A = unknown>(
     return Effect.sync(() => bindable.unbind(eventName, callback));
   }).pipe(Effect.timeout("15 seconds")));
 
-const realDelay = Effect.fn("OfficialClients.realDelay")((milliseconds: number) =>
-  Effect.callback<void>((resume) => {
-    const timeout = setTimeout(() => resume(Effect.void), milliseconds);
-    return Effect.sync(() => clearTimeout(timeout));
-  }));
+const prepareEvent = Effect.fn("OfficialClients.prepareEvent")(
+  <A = unknown>(bindable: Bindable<A>, eventName: string) =>
+    Effect.sync(() => {
+      let completed = Option.none<A>();
+      let resumeEvent = Option.none<(effect: Effect.Effect<A>) => void>();
+      const callback = (data: A) => {
+        bindable.unbind(eventName, callback);
+        if (Option.isSome(resumeEvent)) {
+          resumeEvent.value(Effect.succeed(data));
+        } else {
+          completed = Option.some(data);
+        }
+      };
+      bindable.bind(eventName, callback);
+      return Effect.callback<A>((resume) => {
+        if (Option.isSome(completed)) {
+          resume(Effect.succeed(completed.value));
+        } else {
+          resumeEvent = Option.some(resume);
+        }
+        return Effect.sync(() => bindable.unbind(eventName, callback));
+      }).pipe(Effect.timeout("15 seconds"));
+    }),
+);
+
+const waitForClientEvent = Effect.fn("OfficialClients.waitForClientEvent")(
+  <A>(sender: Triggerable, receiver: Bindable<A>, eventName: string, data: unknown) =>
+    Effect.callback<A, OfficialClientError>((resume) => {
+      const ready = new Set<string>();
+      const trigger = () => {
+        if (ready.size !== 2) {
+          return;
+        }
+        queueMicrotask(() => {
+          if (!sender.trigger(eventName, data)) {
+            resume(
+              Effect.fail(
+                new OfficialClientError({
+                  cause: new Error("Client event trigger was rejected"),
+                  operation: "trigger client event",
+                }),
+              ),
+            );
+          }
+        });
+      };
+      const senderReady = () => {
+        ready.add("sender");
+        trigger();
+      };
+      const receiverReady = () => {
+        ready.add("receiver");
+        trigger();
+      };
+      const received = (value: A) => resume(Effect.succeed(value));
+      sender.bind("pusher:subscription_succeeded", senderReady);
+      receiver.bind("pusher:subscription_succeeded", receiverReady);
+      receiver.bind(eventName, received);
+      return Effect.sync(() => {
+        sender.unbind("pusher:subscription_succeeded", senderReady);
+        receiver.unbind("pusher:subscription_succeeded", receiverReady);
+        receiver.unbind(eventName, received);
+      });
+    }).pipe(Effect.timeout("15 seconds")),
+);
 
 const makeServer = (encrypted = false) =>
   Effect.sync(
@@ -128,18 +192,18 @@ describe("official Pusher clients", () => {
         waitForEvent(first, "pusher:subscription_succeeded"),
         waitForEvent(second, "pusher:subscription_succeeded"),
       ]);
-      const received = yield* Effect.all([
-        waitForEvent<{ readonly message: string }>(first, "multiplexed-event"),
-        waitForEvent<{ readonly message: string }>(second, "multiplexed-event"),
-      ]).pipe(
-        Effect.forkChild,
-        Effect.tap(() =>
-          trigger(server, [firstChannel, secondChannel], "multiplexed-event", {
-            message: "roundtrip",
-          }),
-        ),
-        Effect.flatMap(Fiber.join),
+      const firstReceived = yield* prepareEvent<{ readonly message: string }>(
+        first,
+        "multiplexed-event",
       );
+      const secondReceived = yield* prepareEvent<{ readonly message: string }>(
+        second,
+        "multiplexed-event",
+      );
+      yield* trigger(server, [firstChannel, secondChannel], "multiplexed-event", {
+        message: "roundtrip",
+      });
+      const received = yield* Effect.all([firstReceived, secondReceived]);
       expect(received).toEqual([{ message: "roundtrip" }, { message: "roundtrip" }]);
       expect(client.connection.socket_id).toMatch(/^\d+\.\d+$/);
     }),
@@ -153,21 +217,12 @@ describe("official Pusher clients", () => {
       const channel = testChannel("private-official-room");
       const senderChannel = sender.subscribe(channel);
       const receiverChannel = receiver.subscribe(channel);
-      yield* Effect.all([
-        waitForEvent(senderChannel, "pusher:subscription_succeeded"),
-        waitForEvent(receiverChannel, "pusher:subscription_succeeded"),
-      ]);
-      const receivedFiber = yield* waitForEvent<{ readonly message: string }>(
+      const received = yield* waitForClientEvent<{ readonly message: string }>(
+        senderChannel,
         receiverChannel,
         "client-official-event",
-      ).pipe(Effect.forkChild);
-      yield* realDelay(50);
-      yield* Effect.sync(() => {
-        expect(
-          senderChannel.trigger("client-official-event", { message: "client-roundtrip" }),
-        ).toBe(true);
-      });
-      const received = yield* Fiber.join(receivedFiber);
+        { message: "client-roundtrip" },
+      );
       expect(received).toEqual({ message: "client-roundtrip" });
     }),
   );
@@ -179,22 +234,13 @@ describe("official Pusher clients", () => {
       const channel = testChannel("presence-official-room");
       const firstChannel = first.subscribe(channel);
       yield* waitForEvent(firstChannel, "pusher:subscription_succeeded");
-      const member = yield* waitForEvent<{
+      const memberReceived = yield* prepareEvent<{
         readonly id: string;
         readonly info: { readonly name: string };
-      }>(firstChannel, "pusher:member_added").pipe(
-        Effect.forkChild,
-        Effect.tap(() =>
-          Effect.gen(function* () {
-            const second = yield* makeClient(server, { name: "Two", userId: "user-two" });
-            yield* waitForEvent(
-              second.subscribe(channel),
-              "pusher:subscription_succeeded",
-            );
-          }),
-        ),
-        Effect.flatMap(Fiber.join),
-      );
+      }>(firstChannel, "pusher:member_added");
+      const second = yield* makeClient(server, { name: "Two", userId: "user-two" });
+      yield* waitForEvent(second.subscribe(channel), "pusher:subscription_succeeded");
+      const member = yield* memberReceived;
       expect(member).toEqual({ id: "user-two", info: { name: "Two" } });
     }),
   );
@@ -206,18 +252,14 @@ describe("official Pusher clients", () => {
       const channelName = testChannel("private-encrypted-official-room");
       const channel = client.subscribe(channelName);
       yield* waitForEvent(channel, "pusher:subscription_succeeded");
-      const received = yield* waitForEvent<{ readonly message: string }>(
+      const encryptedReceived = yield* prepareEvent<{ readonly message: string }>(
         channel,
         "encrypted-event",
-      ).pipe(
-        Effect.forkChild,
-        Effect.tap(() =>
-          trigger(server, channelName, "encrypted-event", {
-            message: "secret-roundtrip",
-          }),
-        ),
-        Effect.flatMap(Fiber.join),
       );
+      yield* trigger(server, channelName, "encrypted-event", {
+        message: "secret-roundtrip",
+      });
+      const received = yield* encryptedReceived;
       expect(received).toEqual({ message: "secret-roundtrip" });
     }),
   );

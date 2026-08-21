@@ -103,6 +103,25 @@ Current endpoints are events, batch events, occupied channel queries, presence u
 user connection termination. A single publish targets at most 100 channels, a batch contains at
 most 10 events, and event data is at most 10 KB.
 
+## Application control API
+
+The service-specific control API is authenticated with
+`Authorization: Bearer <PUSHER_CONTROL_TOKEN>` and exposes:
+
+```text
+GET    /control/v1/apps
+POST   /control/v1/apps
+GET    /control/v1/apps/{app_id}
+PATCH  /control/v1/apps/{app_id}
+DELETE /control/v1/apps/{app_id}
+```
+
+Creation returns the generated app secret, authorization token, and encryption key exactly once.
+Subsequent reads return only application metadata and the public app key. Jurisdiction and
+location hints are selected at creation and are immutable because changing either value does not
+relocate existing named Durable Objects. Deletion leaves an app ID tombstone, so an ID cannot be
+reused for another tenant.
+
 ## Compatibility surface
 
 Direct protocol test lanes are pusher-js (protocol 7), Java/Android (5), Swift (7 and WebSocket

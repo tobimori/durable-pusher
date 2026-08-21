@@ -18,6 +18,8 @@ export default defineConfig({
     coverage: {
       reporter: ["text", "html"],
     },
+    fileParallelism: false,
     include: ["test/**/*.test.ts"],
+    testTimeout: 20_000,
   },
 });
