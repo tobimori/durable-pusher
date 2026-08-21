@@ -1,0 +1,33 @@
+{
+  "name": "durable-pusher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "vp check",
+    "deploy": "alchemy deploy",
+    "destroy": "alchemy destroy",
+    "dev": "alchemy dev",
+    "fix": "vp check --fix",
+    "logs": "alchemy logs",
+    "plan": "alchemy plan",
+    "tail": "alchemy tail",
+    "test": "vp test run",
+    "test:watch": "vp test"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.3.0",
+    "effect": "4.0.0-rc.111"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260821.1",
+    "alchemy": "2.0.0-beta.72",
+    "typescript": "7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.2.9",
+    "vite-plus": "0.2.9"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "packageManager": "pnpm@11.21.0"
+}

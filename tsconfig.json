@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "exactOptionalPropertyTypes": true,
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ESNext",
+    "types": ["@cloudflare/workers-types"],
+    "verbatimModuleSyntax": true
+  },
+  "include": ["alchemy.run.ts", "src/**/*.ts", "test/**/*.ts", "vite.config.ts"]
+}

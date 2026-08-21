@@ -1,0 +1,19 @@
+packages:
+  - .
+
+allowBuilds:
+  msgpackr-extract: false
+  sharp: false
+  workerd: true
+
+minimumReleaseAgeExclude:
+  - "@cloudflare/workers-types@5.20260821.1"
+
+overrides:
+  vite: npm:@voidzero-dev/vite-plus-core@0.2.9
+  vitest: 4.1.10
+
+peerDependencyRules:
+  allowedVersions:
+    typescript: 7.0.2
+    vite: 0.2.9
