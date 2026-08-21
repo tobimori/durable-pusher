@@ -96,12 +96,16 @@ export const CachedEvent = Schema.Struct({
 export const ChannelSnapshot = Schema.Struct({
   barrier: Schema.Int,
   cache: Schema.NullOr(CachedEvent),
-  subscriptionCount: Schema.Int,
 });
 
 export const PresenceMember = Schema.Struct({
   userId: Schema.String,
   userInfo: Schema.Json,
+});
+
+export const PresenceConnection = Schema.Struct({
+  ...PresenceMember.fields,
+  socketId: Schema.String,
 });
 
 export const PresenceSnapshot = Schema.Struct({
@@ -111,7 +115,6 @@ export const PresenceSnapshot = Schema.Struct({
 
 export const PresenceJoin = Schema.Struct({
   ...ApplicationPlacement.fields,
-  branchName: Schema.String,
   channel: Schema.String,
   socketId: Schema.String,
   userId: Schema.String,
@@ -133,9 +136,22 @@ export const DirectoryEntry = Schema.Struct({
 
 export const Attachment = Schema.Struct({
   ...ApplicationPlacement.fields,
+  eventCount: Schema.Int,
+  eventWindow: Schema.Int,
   protocol: Schema.Int,
   shardName: Schema.String,
   socketId: Schema.String,
+  subscriptions: Schema.Array(
+    Schema.Struct({
+      channel: Schema.String,
+      kind: Schema.Literals(["public", "private", "presence", "encrypted"]),
+      registrationToken: Schema.String,
+      state: Schema.Literals(["joining", "active"]),
+      userId: Schema.optionalKey(Schema.String),
+      userInfo: Schema.optionalKey(Schema.Json),
+    }),
+  ),
+  userData: Schema.optionalKey(Schema.String),
   userId: Schema.optionalKey(Schema.String),
 });
 
@@ -148,6 +164,7 @@ export type DeliveryEncoded = typeof Delivery.Encoded;
 export type CachedEvent = typeof CachedEvent.Type;
 export type ChannelSnapshot = typeof ChannelSnapshot.Type;
 export type PresenceMember = typeof PresenceMember.Type;
+export type PresenceConnection = typeof PresenceConnection.Type;
 export type PresenceSnapshot = typeof PresenceSnapshot.Type;
 export type PresenceJoin = typeof PresenceJoin.Type;
 export type PresenceJoinEncoded = typeof PresenceJoin.Encoded;

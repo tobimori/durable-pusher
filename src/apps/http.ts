@@ -1,3 +1,4 @@
+import type { RuntimeContext } from "alchemy";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
@@ -7,10 +8,20 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import { AppRegistry } from "../actors/contracts.ts";
 import { timingSafeEqual } from "../pusher/crypto.ts";
 import { ApiError, type JsonValue } from "../pusher/protocol.ts";
-import { ApplicationCreate, ApplicationPatch } from "./model.ts";
+import {
+  ApplicationCreate,
+  ApplicationPatch,
+  ApplicationPlacement,
+  ApplicationSummary,
+  type ApplicationPlacementEncoded,
+  type ApplicationSummaryEncoded,
+} from "./model.ts";
 
 type RegistryNamespace = Effect.Success<typeof AppRegistry>;
 type ParsedUrl = typeof Schema.URLFromString.Type;
+type ApplicationTerminator = (
+  placement: ApplicationPlacementEncoded,
+) => Effect.Effect<number, { readonly message: string }, RuntimeContext>;
 
 const decodeJsonValue = Schema.decodeEffect(Schema.fromJsonString(Schema.Json));
 const decodePathSegment = Schema.decodeEffect(Schema.StringFromUriComponent);
@@ -70,7 +81,24 @@ const applicationId = Effect.fn("ApplicationsHttp.applicationId")(function* (url
 export const makeApplicationsHttp = (
   applications: RegistryNamespace,
   controlToken: Redacted.Redacted<string>,
+  terminateApplication: ApplicationTerminator,
 ) => {
+  const terminate = Effect.fn("ApplicationsHttp.terminate")(function* (
+    encoded: ApplicationSummaryEncoded,
+  ) {
+    const application = yield* Schema.decodeEffect(ApplicationSummary)(encoded).pipe(
+      Effect.mapError(() => apiError(503, "Application settings could not be decoded")),
+    );
+    const placement = yield* Schema.encodeEffect(ApplicationPlacement)({
+      appId: application.appId,
+      jurisdiction: application.jurisdiction,
+      locationHint: application.locationHint,
+    }).pipe(Effect.mapError(() => apiError(503, "Application placement could not be encoded")));
+    yield* terminateApplication(placement).pipe(
+      Effect.mapError(() => apiError(503, "Application connections could not be terminated")),
+    );
+  });
+
   const authorize = Effect.fn("ApplicationsHttp.authorize")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
@@ -141,9 +169,24 @@ export const makeApplicationsHttp = (
               : apiError(503, "Application registry is unavailable"),
           ),
         );
+      if (Option.contains(patch.enabled, false)) {
+        yield* terminate(application);
+      }
       return yield* json(application);
     }
     if (request.method === "DELETE") {
+      const current = Option.fromNullishOr(
+        yield* registry.get(appId.value).pipe(registryUnavailable),
+      );
+      if (Option.isNone(current)) {
+        return yield* apiError(404, "Application does not exist");
+      }
+      const disablePatch = yield* Schema.encodeEffect(ApplicationPatch)({
+        enabled: Option.some(false),
+        name: Option.none(),
+      }).pipe(Effect.mapError(() => apiError(503, "Application patch could not be encoded")));
+      const disabled = yield* registry.update(appId.value, disablePatch).pipe(registryUnavailable);
+      yield* terminate(disabled);
       const removed = yield* registry.remove(appId.value).pipe(registryUnavailable);
       if (!removed) {
         return yield* apiError(404, "Application does not exist");

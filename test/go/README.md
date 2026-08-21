@@ -1,10 +1,10 @@
 # Official Go SDK integration
 
-This module provisions a temporary `us`/`wnam` application through the control API, then uses the
-official [`pusher-http-go/v5`](https://github.com/pusher/pusher-http-go) SDK to trigger an event,
-query channel state, and trigger a batch against the running service.
+This module creates a temporary `us`/`wnam` application through the control API. It then uses the
+official [`pusher-http-go/v5`](https://github.com/pusher/pusher-http-go) SDK. The test publishes one
+event, gets the channel state, and publishes one event batch.
 
-With the local stack running:
+Start the local service. Then, run this command from `test/go`:
 
 ```sh
 PUSHER_GO_E2E=1 \
@@ -13,6 +13,6 @@ PUSHER_CONTROL_TOKEN=control-token \
 mise exec go@1.25 -- go test -v ./...
 ```
 
-Run the command from `test/go`. The test skips unless `PUSHER_GO_E2E=1` is set and deletes its
-temporary application on completion. Workerd does not implement jurisdiction enforcement; that
-part of placement must be verified on Cloudflare.
+The test runs only if `PUSHER_GO_E2E` is `1`. The test deletes its temporary application when it is
+complete. Workerd does not enforce jurisdictions. Run the test on Cloudflare to verify jurisdiction
+placement.

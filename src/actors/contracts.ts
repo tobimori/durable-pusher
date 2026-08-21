@@ -16,6 +16,7 @@ import type {
   ChannelSnapshot,
   DeliveryEncoded,
   DirectoryEntry,
+  PresenceConnection,
   PresenceJoinEncoded,
   PresenceSnapshot,
 } from "../pusher/protocol.ts";
@@ -26,23 +27,45 @@ import type {
 type ActorEffect<A> = Effect.Effect<A, ActorError, RuntimeContext>;
 
 export interface ConnectionShardApi {
+  readonly count: (channel: string) => ActorEffect<number>;
   readonly deliver: (delivery: DeliveryEncoded) => ActorEffect<number>;
+  readonly presence: (channel: string) => ActorEffect<ReadonlyArray<PresenceConnection>>;
+  readonly terminateApplication: (appId: string) => ActorEffect<number>;
   readonly terminateUser: (appId: string, userId: string) => ActorEffect<number>;
 }
 
 export interface ChannelShardApi {
-  readonly setBranch: (
+  readonly broadcastSubscriptionCount: (
     placement: ApplicationPlacementEncoded,
     channel: string,
-    branchName: string,
-    subscriptionCount: number,
-    generation: number,
+  ) => ActorEffect<void>;
+  readonly registerGateway: (
+    placement: ApplicationPlacementEncoded,
+    channel: string,
+    gatewayName: string,
+    registrationToken: string,
   ) => ActorEffect<ChannelSnapshot>;
+  readonly snapshot: (
+    placement: ApplicationPlacementEncoded,
+    channel: string,
+  ) => ActorEffect<ChannelSnapshot>;
+  readonly settlePresence: (
+    placement: ApplicationPlacementEncoded,
+    channel: string,
+    socketId: string,
+  ) => ActorEffect<void>;
   readonly joinPresence: (join: PresenceJoinEncoded) => ActorEffect<PresenceSnapshot>;
   readonly leavePresence: (
     placement: ApplicationPlacementEncoded,
     channel: string,
     socketId: string,
+    userId: string,
+  ) => ActorEffect<void>;
+  readonly unregisterGateway: (
+    placement: ApplicationPlacementEncoded,
+    channel: string,
+    gatewayName: string,
+    registrationToken: string,
   ) => ActorEffect<void>;
   readonly publish: (
     placement: ApplicationPlacementEncoded,
@@ -52,7 +75,7 @@ export interface ChannelShardApi {
     excludedSocketId: string | null,
     userId: string | null,
     updateCache: boolean,
-  ) => ActorEffect<ChannelInfo>;
+  ) => ActorEffect<void>;
   readonly info: (
     placement: ApplicationPlacementEncoded,
     channel: string,
@@ -63,16 +86,43 @@ export interface ChannelShardApi {
   ) => ActorEffect<ReadonlyArray<string>>;
 }
 
-export interface FanoutShardApi {
-  readonly setGateway: (
+export interface ConnectionShardCatalogApi {
+  readonly expand: (
+    placement: ApplicationPlacementEncoded,
+    expectedShardCount: number,
+  ) => ActorEffect<number>;
+  readonly shardCount: (placement: ApplicationPlacementEncoded) => ActorEffect<number>;
+}
+
+export interface FanoutRelayApi {
+  readonly count: (
     placement: ApplicationPlacementEncoded,
     channel: string,
-    branchName: string,
-    gatewayName: string,
-    subscriptionCount: number,
-    gatewayGeneration: number,
-  ) => ActorEffect<ChannelSnapshot>;
-  readonly deliver: (delivery: DeliveryEncoded) => ActorEffect<void>;
+    gatewayNames: ReadonlyArray<string>,
+    path: string,
+  ) => ActorEffect<number>;
+  readonly deliver: (
+    delivery: DeliveryEncoded,
+    gatewayNames: ReadonlyArray<string>,
+    path: string,
+  ) => ActorEffect<ReadonlyArray<string>>;
+  readonly presence: (
+    placement: ApplicationPlacementEncoded,
+    channel: string,
+    gatewayNames: ReadonlyArray<string>,
+    path: string,
+  ) => ActorEffect<ReadonlyArray<PresenceConnection>>;
+  readonly terminateApplication: (
+    placement: ApplicationPlacementEncoded,
+    gatewayNames: ReadonlyArray<string>,
+    path: string,
+  ) => ActorEffect<number>;
+  readonly terminateUser: (
+    placement: ApplicationPlacementEncoded,
+    userId: string,
+    gatewayNames: ReadonlyArray<string>,
+    path: string,
+  ) => ActorEffect<number>;
 }
 
 export interface ChannelDirectoryShardApi {
@@ -81,13 +131,6 @@ export interface ChannelDirectoryShardApi {
 }
 
 export interface UserShardApi {
-  readonly setGateway: (
-    placement: ApplicationPlacementEncoded,
-    userId: string,
-    gatewayName: string,
-    connectionCount: number,
-    generation: number,
-  ) => ActorEffect<void>;
   readonly terminate: (
     placement: ApplicationPlacementEncoded,
     userId: string,
@@ -120,8 +163,13 @@ export class ChannelShard extends Cloudflare.DurableObject<ChannelShard, Channel
   "ChannelShard",
 ) {}
 
-export class FanoutShard extends Cloudflare.DurableObject<FanoutShard, FanoutShardApi>()(
-  "FanoutShard",
+export class ConnectionShardCatalog extends Cloudflare.DurableObject<
+  ConnectionShardCatalog,
+  ConnectionShardCatalogApi
+>()("ConnectionShardCatalog") {}
+
+export class FanoutRelay extends Cloudflare.DurableObject<FanoutRelay, FanoutRelayApi>()(
+  "FanoutRelay",
 ) {}
 
 export class ChannelDirectoryShard extends Cloudflare.DurableObject<
@@ -141,7 +189,8 @@ export class PusherWorker extends Cloudflare.Worker<
   | AppRegistry
   | ChannelDirectoryShard
   | ChannelShard
+  | ConnectionShardCatalog
   | ConnectionShard
-  | FanoutShard
+  | FanoutRelay
   | UserShard
 >()("DurablePusher") {}

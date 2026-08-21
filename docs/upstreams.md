@@ -1,6 +1,6 @@
 # Upstream snapshots
 
-The ignored `.repos` directory contains shallow reference clones used during implementation.
+The ignored `.repos` directory contains shallow clones. These clones are implementation references.
 
 | Reference  | Commit                                     | Package version  |
 | ---------- | ------------------------------------------ | ---------------- |
@@ -8,4 +8,5 @@ The ignored `.repos` directory contains shallow reference clones used during imp
 | Alchemy v2 | `252b2e1687a372b33404c1653ed6941654ce80ac` | `2.0.0-beta.72`  |
 | anti-slop  | `6d538555cb151d4121ed51a27db81890eacf8ae9` | source reference |
 
-The application pins the matching published versions rather than importing from `.repos`.
+The application uses the applicable published package versions. It does not import code from
+`.repos`.

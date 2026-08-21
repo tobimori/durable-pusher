@@ -9,6 +9,7 @@ export interface AppConfigShape {
   readonly appSecret: Redacted.Redacted<string>;
   readonly authToken: Redacted.Redacted<string>;
   readonly controlToken: Redacted.Redacted<string>;
+  readonly connectionShardSoftLimit: number;
   readonly encryptionMasterKey: Redacted.Redacted<string>;
 }
 
@@ -22,6 +23,9 @@ export const AppConfigLive = Layer.effect(
     appSecret: Config.redacted("PUSHER_APP_SECRET"),
     authToken: Config.redacted("PUSHER_AUTH_TOKEN"),
     controlToken: Config.redacted("PUSHER_CONTROL_TOKEN"),
+    connectionShardSoftLimit: Config.int("PUSHER_CONNECTION_SHARD_SOFT_LIMIT").pipe(
+      Config.withDefault(2_000),
+    ),
     encryptionMasterKey: Config.redacted("PUSHER_ENCRYPTION_MASTER_KEY").pipe(
       Config.withDefault(Redacted.make("")),
     ),

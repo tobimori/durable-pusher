@@ -4,9 +4,11 @@ Research date: 2026-08-21.
 
 ## Connection model
 
-Official clients connect to `/app/{app_key}` and supply `protocol`, `client`, and `version` query
-parameters. Current client families require protocol versions 5, 6, and 7. A successful upgrade
-receives a double-encoded handshake:
+Official clients connect to `/app/{app_key}`. They supply the `protocol`, `client`, and `version`
+query parameters. The service accepts protocol versions 5, 6, and 7.
+
+After a successful upgrade, the server sends this handshake. The `data` value is an encoded JSON
+string.
 
 ```json
 {
@@ -15,18 +17,19 @@ receives a double-encoded handshake:
 }
 ```
 
-The socket ID must match `^\d+\.\d+$`. Each reconnect receives a new ID and recreates all server
-state. Clients retain their requested channel set, then resubscribe and reauthorize after the new
-handshake.
+The socket ID must match `^\d+\.\d+$`. The server gives a new ID to each reconnection. The server
+does not keep state from the old connection. The client keeps its requested channel list. After the
+new handshake, the client subscribes and authorizes again.
 
-A connection is independent from a channel. One WebSocket sends any number of
-`pusher:subscribe` and `pusher:unsubscribe` commands. The server must keep a per-socket channel set;
-it cannot assign the socket itself to a channel actor.
+A connection is independent of a channel. One WebSocket can send multiple `pusher:subscribe` and
+`pusher:unsubscribe` commands. The server keeps a channel list for each socket. It does not assign
+the socket to one channel object.
 
 ## Message encoding
 
-Every protocol message is a UTF-8 WebSocket text frame with an `event` string. Server application
-events always carry string-valued `data`, including when the application payload is JSON:
+Each protocol message is a UTF-8 WebSocket text frame. Each message has an `event` string. Server
+application events always have a string in `data`. This rule also applies when the application data
+is JSON.
 
 ```json
 {
@@ -36,49 +39,62 @@ events always carry string-valued `data`, including when the application payload
 }
 ```
 
-This double encoding is required by Swift and preserves the behavior of JavaScript, Java, .NET,
-and Objective-C clients. `pusher:error` is the notable exception and carries an object-valued
-`data` field.
+Swift clients require this double encoding. JavaScript, Java, .NET, and Objective-C clients also
+support it. The `pusher:error` event is different. Its `data` field contains an object.
 
 ## Subscription behavior
 
-Public channels need no signature. Private, presence, and encrypted channel signatures are
-lowercase hexadecimal HMAC-SHA256 values prefixed by the app key:
+Public channels do not require a signature. Private, presence, and encrypted channels require a
+signature. The signature starts with the application key. The signature value is a lowercase
+hexadecimal HMAC-SHA256 value.
 
 ```text
 private:  socket_id:channel_name
 presence: socket_id:channel_name:exact_channel_data_string
 ```
 
-Presence snapshots count unique users, while ordinary subscription counts count connections. A
-user with several sockets emits `member_added` on its first join and `member_removed` after its
-last departure. Duplicate subscribe and unsubscribe commands are idempotent.
+A presence snapshot counts unique users. An ordinary subscription count counts connections. The
+server sends `member_added` when the first connection of a user joins. It sends `member_removed`
+after the last connection of the user leaves.
 
-Encrypted channels use the same WebSocket subscription protocol as private channels. Official
-server SDKs encrypt event data before calling the HTTP API, so the realtime server forwards the
-encrypted `nonce` and `ciphertext` JSON string without decrypting it.
+The server accepts duplicate subscribe and unsubscribe commands. A duplicate command does not
+change the result.
 
-Cache channels retain one server-published event for at most 30 minutes. A cache hit is delivered
-before `pusher_internal:subscription_succeeded`; a miss produces `pusher:cache_miss`.
+Encrypted channels use the private-channel WebSocket subscription protocol. Official server SDKs
+encrypt event data before they call the HTTP API. The realtime server forwards the encrypted JSON
+string. It does not decrypt the `nonce` or `ciphertext`.
 
-Client events are accepted only when enabled, named `client-*`, and sent by a subscribed private
-or presence socket. They are limited to 10 events per second per connection and are not echoed to
-their originating socket.
+A cache channel keeps one server event for a maximum of 30 minutes. For a cache hit, the server sends
+the event before `pusher_internal:subscription_succeeded`. For a cache miss, the server sends
+`pusher:cache_miss`.
+
+The server accepts client events only when the application enables them. A client event name must
+start with `client-`. A subscribed private or presence socket must send the event. Each connection
+can send a maximum of 10 client events each second. The server does not send the event back to its
+source socket.
 
 ## Heartbeats and errors
 
-The server answers `pusher:ping` with `pusher:pong`; Java clients may omit the ping's `data` field.
-Native RFC 6455 ping/pong remains enabled independently. The advertised activity timeout is 120
-seconds.
+The server answers `pusher:ping` with `pusher:pong`. Java clients can omit the `data` field from the
+ping. Native RFC 6455 ping and pong frames operate independently. The server specifies an activity
+timeout of 120 seconds.
 
-Protocols below 6 receive a `pusher:error` frame before a fatal close. Protocols 6 and 7 use the
-WebSocket close code directly. Important fatal codes include invalid app `4001`, unsupported
-protocol `4007`, missing protocol `4008`, over-capacity retry `4100`, immediate reconnect `4200`,
-and heartbeat timeout `4201`.
+For protocol version 5, the server sends `pusher:error` before a fatal close. For protocol versions 6
+and 7, the server uses the WebSocket close code.
+
+| Code   | Cause                         |
+| ------ | ----------------------------- |
+| `4001` | The application is invalid    |
+| `4007` | The protocol is not supported |
+| `4008` | The protocol is missing       |
+| `4100` | The client must retry later   |
+| `4200` | The client must reconnect now |
+| `4201` | The heartbeat timed out       |
 
 ## HTTP API
 
-Official server libraries sign requests to `/apps/{app_id}/...` with these query parameters:
+Official server libraries sign requests to `/apps/{app_id}/...`. A signed request has these query
+parameters:
 
 ```text
 auth_key
@@ -88,25 +104,39 @@ body_md5
 auth_signature
 ```
 
-The signature input is:
+Use this string as the signature input:
 
 ```text
 UPPERCASE_METHOD + "\n" + REQUEST_PATH + "\n" + SORTED_DECODED_QUERY_WITHOUT_SIGNATURE
 ```
 
-`body_md5` is the lowercase MD5 of the exact body bytes. `auth_signature` is lowercase
-HMAC-SHA256. Timestamps must be less than 600 seconds from server time. Successful mutation
-responses use HTTP 200 and a JSON body, at minimum `{}`, because several official SDKs always
-decode the response.
+`body_md5` is the lowercase MD5 value of the exact body bytes. `auth_signature` is a lowercase
+HMAC-SHA256 value. The difference between the timestamp and server time must be less than 600
+seconds.
 
-Current endpoints are events, batch events, occupied channel queries, presence user queries, and
-user connection termination. A single publish targets at most 100 channels, a batch contains at
-most 10 events, and event data is at most 10 KB.
+A successful change request returns HTTP 200 and a JSON body. The smallest valid body is `{}`.
+Several official SDKs always decode this body.
+
+The API has endpoints for these operations:
+
+- Publish one event
+- Publish a batch of events
+- Get occupied channels
+- Get presence users
+- Terminate user connections
+
+One publish operation can target a maximum of 100 channels. One batch can contain a maximum of 10
+events. Event data can have a maximum size of 10 KB.
 
 ## Application control API
 
-The service-specific control API is authenticated with
-`Authorization: Bearer <PUSHER_CONTROL_TOKEN>` and exposes:
+Use this header to authenticate with the service control API:
+
+```text
+Authorization: Bearer <PUSHER_CONTROL_TOKEN>
+```
+
+The control API has these endpoints:
 
 ```text
 GET    /control/v1/apps
@@ -116,18 +146,26 @@ PATCH  /control/v1/apps/{app_id}
 DELETE /control/v1/apps/{app_id}
 ```
 
-Creation returns the generated app secret, authorization token, and encryption key exactly once.
-Subsequent reads return only application metadata and the public app key. Jurisdiction and
-location hints are selected at creation and are immutable because changing either value does not
-relocate existing named Durable Objects. Deletion leaves an app ID tombstone, so an ID cannot be
-reused for another tenant.
+Application creation returns the generated secret, authorization token, and encryption key. The
+service returns these values only one time. Later reads return application data and the public
+application key.
 
-## Compatibility surface
+Select the jurisdiction and location hint when you create the application. You cannot change these
+values. A change cannot move existing named Durable Objects. Application deletion keeps an ID
+tombstone. Therefore, you cannot use the ID for a different tenant.
 
-Direct protocol test lanes are pusher-js (protocol 7), Java/Android (5), Swift (7 and WebSocket
-subprotocol negotiation), .NET/Unity (5), and legacy Objective-C (6). Browser XHR streaming,
-polling, and SockJS are separate fallback transports and are not part of WebSocket protocol
-compatibility.
+## Tested clients
+
+Direct protocol tests use these clients:
+
+- pusher-js with protocol 7
+- Java and Android with protocol 5
+- Swift with protocol 7 and WebSocket subprotocol negotiation
+- .NET and Unity with protocol 5
+- Legacy Objective-C with protocol 6
+
+Browser XHR streaming, polling, and SockJS are fallback transports. The WebSocket compatibility
+tests do not include these transports.
 
 ## Primary sources
 

@@ -31,7 +31,6 @@ const ClientFrame = Schema.Struct({
 });
 const encodeClientFrame = Schema.encodeEffect(Schema.fromJsonString(ClientFrame));
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
-const PresenceRoomSize = PositiveInt.check(Schema.isLessThanOrEqualTo(100));
 const clientEventName = "client-presence-load";
 
 const config = Config.all({
@@ -63,18 +62,6 @@ const loadError = (connection, operation, message) =>
 const positiveInt = Effect.fn("ConnectionLoad.positiveInt")((name, value) =>
   Schema.decodeEffect(PositiveInt)(value).pipe(
     Effect.mapError(() => loadError(0, "configuration", `${name} must be a positive integer`)),
-  ),
-);
-
-const presenceRoomSize = Effect.fn("ConnectionLoad.presenceRoomSize")((value) =>
-  Schema.decodeEffect(PresenceRoomSize)(value).pipe(
-    Effect.mapError(() =>
-      loadError(
-        0,
-        "configuration",
-        "PUSHER_LOAD_PRESENCE_ROOM_SIZE must be between 1 and 100",
-      ),
-    ),
   ),
 );
 
@@ -469,7 +456,7 @@ const program = Effect.scoped(
       settings.heartbeatSeconds,
     );
     const idleSeconds = yield* positiveInt("PUSHER_LOAD_IDLE_SECONDS", settings.idleSeconds);
-    const roomSize = yield* presenceRoomSize(settings.roomSize);
+    const roomSize = yield* positiveInt("PUSHER_LOAD_PRESENCE_ROOM_SIZE", settings.roomSize);
     const url = makeUrl(settings);
     const server = new PusherServer({
       appId: settings.appId,

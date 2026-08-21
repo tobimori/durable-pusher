@@ -3,37 +3,41 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
+import * as Random from "effect/Random";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Headers from "effect/unstable/http/Headers";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import { ChannelShardLive } from "./actors/channel.ts";
+import { ConnectionShardCatalogLive } from "./actors/catalog.ts";
 import { ConnectionShardLive } from "./actors/connection.ts";
 import {
   AppRegistry,
   ChannelDirectoryShard,
   ChannelShard,
+  ConnectionShardCatalog,
   ConnectionShard,
-  FanoutShard,
+  FanoutRelay,
   PusherWorker,
   UserShard,
 } from "./actors/contracts.ts";
 import {
   ChannelActorDependencies,
   ConnectionActorDependencies,
-  FanoutActorDependencies,
+  FanoutRelayDependencies,
   HttpActorDependencies,
   UserActorDependencies,
 } from "./actors/dependencies.ts";
 import { ChannelDirectoryShardLive } from "./actors/directory.ts";
-import { FanoutShardLive } from "./actors/fanout.ts";
+import { FanoutRelayLive } from "./actors/relay.ts";
 import { makePlacedNamespace } from "./actors/placement.ts";
 import { AppRegistryLive } from "./actors/registry.ts";
 import { UserShardLive } from "./actors/user.ts";
 import {
   ApplicationBootstrap,
-  type ApplicationPlacement,
+  ApplicationPlacement,
+  type ApplicationPlacementEncoded,
   RuntimeApplication,
 } from "./apps/model.ts";
 import { makeApplicationsHttp } from "./apps/http.ts";
@@ -41,7 +45,7 @@ import { AppConfig, AppConfigLive } from "./config.ts";
 import { WorkerNames, WorkerNamesLive } from "./hosts/names.ts";
 import { makePusherHttp } from "./pusher/http.ts";
 import { ApiError } from "./pusher/protocol.ts";
-import { randomConnectionShardName } from "./sharding.ts";
+import { connectionShardCatalogName, connectionShardName, fanoutRelayName } from "./sharding.ts";
 
 export { PusherWorker };
 
@@ -98,27 +102,34 @@ export const PusherWorkerLive = PusherWorker.make(
     const environment = yield* Cloudflare.WorkerEnvironment;
     const applications = yield* AppRegistry.from(PusherWorker);
     const channels = yield* ChannelShard.from(PusherWorker);
+    const catalogs = yield* ConnectionShardCatalog.from(PusherWorker);
     const connections = yield* ConnectionShard.from(PusherWorker);
     const directories = yield* ChannelDirectoryShard.from(PusherWorker);
-    const fanouts = yield* FanoutShard.from(PusherWorker);
     const users = yield* UserShard.from(PusherWorker);
+    const relays = yield* FanoutRelay.from(PusherWorker);
     const placedChannels = makePlacedNamespace("ChannelShard", channels, environment);
     const placedConnections = makePlacedNamespace("ConnectionShard", connections, environment);
+    const placedCatalogs = makePlacedNamespace("ConnectionShardCatalog", catalogs, environment);
     const placedDirectories = makePlacedNamespace(
       "ChannelDirectoryShard",
       directories,
       environment,
     );
-    const placedFanouts = makePlacedNamespace("FanoutShard", fanouts, environment);
     const placedUsers = makePlacedNamespace("UserShard", users, environment);
+    const placedRelays = makePlacedNamespace("FanoutRelay", relays, environment);
+    const config = yield* AppConfig;
+    if (config.connectionShardSoftLimit < 1) {
+      return yield* Effect.die(new Error("PUSHER_CONNECTION_SHARD_SOFT_LIMIT must be positive"));
+    }
     const actorsLive = Layer.mergeAll(
       AppRegistryLive,
       ChannelDirectoryShardLive,
       ChannelShardLive.pipe(
         Layer.provide(
           Layer.succeed(ChannelActorDependencies, {
+            connections: placedConnections,
             directories: placedDirectories,
-            fanouts: placedFanouts,
+            relays: placedRelays,
           }),
         ),
       ),
@@ -127,23 +138,25 @@ export const PusherWorkerLive = PusherWorker.make(
           Layer.succeed(ConnectionActorDependencies, {
             applications,
             channels: placedChannels,
-            fanouts: placedFanouts,
+            connectionShardSoftLimit: config.connectionShardSoftLimit,
             users: placedUsers,
           }),
         ),
       ),
-      FanoutShardLive.pipe(
+      ConnectionShardCatalogLive,
+      FanoutRelayLive.pipe(
         Layer.provide(
-          Layer.succeed(FanoutActorDependencies, {
-            channels: placedChannels,
+          Layer.succeed(FanoutRelayDependencies, {
             connections: placedConnections,
+            relays: placedRelays,
           }),
         ),
       ),
       UserShardLive.pipe(
         Layer.provide(
           Layer.succeed(UserActorDependencies, {
-            connections: placedConnections,
+            catalogs: placedCatalogs,
+            relays: placedRelays,
           }),
         ),
       ),
@@ -153,8 +166,9 @@ export const PusherWorkerLive = PusherWorker.make(
         AppRegistry,
         ChannelDirectoryShard,
         ChannelShard,
+        ConnectionShardCatalog,
         ConnectionShard,
-        FanoutShard,
+        FanoutRelay,
         UserShard,
       ],
       { concurrency: "unbounded", discard: true },
@@ -166,8 +180,33 @@ export const PusherWorkerLive = PusherWorker.make(
       users: placedUsers,
     });
     const http = yield* makePusherHttp.pipe(Effect.provide(httpDependencies));
-    const config = yield* AppConfig;
-    const applicationsHttp = makeApplicationsHttp(applications, config.controlToken);
+    const terminateApplication = Effect.fn("PusherWorker.terminateApplication")(function* (
+      encodedPlacement: ApplicationPlacementEncoded,
+    ) {
+      const placement = yield* Schema.decodeEffect(ApplicationPlacement)(encodedPlacement);
+      const catalog = yield* placedCatalogs.getByName(
+        connectionShardCatalogName(placement.appId),
+        placement,
+      );
+      const shardCount = yield* catalog.shardCount(encodedPlacement);
+      const path = "terminate.root";
+      const relay = yield* placedRelays.getByName(
+        fanoutRelayName(placement.appId, "application-control", path),
+        placement,
+      );
+      return yield* relay.terminateApplication(
+        encodedPlacement,
+        Array.from({ length: shardCount }, (_, shard) =>
+          connectionShardName(placement.appId, shard),
+        ),
+        path,
+      );
+    });
+    const applicationsHttp = makeApplicationsHttp(
+      applications,
+      config.controlToken,
+      terminateApplication,
+    );
     const bootstrapInput = yield* Schema.encodeEffect(ApplicationBootstrap)({
       appId: config.appId,
       appKey: config.appKey,
@@ -184,6 +223,71 @@ export const PusherWorkerLive = PusherWorker.make(
       },
       Effect.mapError(() => apiError(503, "Application registry is unavailable")),
     );
+    const shardCounts = new Map<string, number>();
+
+    const routeConnection = Effect.fn("PusherWorker.routeConnection")(function* (
+      request: HttpServerRequest.HttpServerRequest,
+      source: Request,
+      application: RuntimeApplication,
+    ) {
+      const placement = placementOf(application);
+      const encodedPlacement =
+        yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
+      const catalog = yield* placedCatalogs
+        .getByName(connectionShardCatalogName(application.appId), placement)
+        .pipe(actorApiError);
+      let shardCount = shardCounts.get(application.appId);
+      if (shardCount === undefined) {
+        shardCount = yield* catalog.shardCount(encodedPlacement).pipe(actorApiError);
+        shardCounts.set(application.appId, shardCount);
+      }
+      let candidateFloor = 0;
+
+      for (let round = 0; round < 32; round += 1) {
+        const attempts = Math.min(shardCount, 8);
+        const tried = new Set<number>();
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+          let shard =
+            attempt === 0 && candidateFloor < shardCount
+              ? yield* Random.nextIntBetween(candidateFloor, shardCount)
+              : yield* Random.nextIntBetween(0, shardCount);
+          while (tried.has(shard) && tried.size < shardCount) {
+            shard = (shard + 1) % shardCount;
+          }
+          tried.add(shard);
+          const shardName = connectionShardName(application.appId, shard);
+          const routedRequest = yield* Effect.sync(() =>
+            HttpServerRequest.fromWeb(
+              new Request(source, {
+                headers: Headers.set(
+                  request.headers,
+                  "x-durable-pusher-connection-shard",
+                  shardName,
+                ),
+              }),
+            ),
+          );
+          const connection = yield* placedConnections
+            .getByName(shardName, placement)
+            .pipe(actorApiError);
+          const response = yield* connection.fetch(routedRequest).pipe(actorApiError);
+          if (!Option.contains(Headers.get(response.headers, "x-durable-pusher-shard-full"), "1")) {
+            return response;
+          }
+        }
+
+        const latest = yield* catalog.shardCount(encodedPlacement).pipe(actorApiError);
+        const previousCount = shardCount;
+        shardCount =
+          latest > shardCount
+            ? latest
+            : yield* catalog.expand(encodedPlacement, shardCount).pipe(actorApiError);
+        candidateFloor = Math.min(previousCount, shardCount - 1);
+        shardCounts.set(application.appId, shardCount);
+      }
+
+      return HttpServerResponse.text("Connection shards are temporarily full", { status: 503 });
+    });
 
     const route = Effect.fn("PusherWorker.route")(function* (
       request: HttpServerRequest.HttpServerRequest,
@@ -239,15 +343,16 @@ export const PusherWorkerLive = PusherWorker.make(
               ),
             )
           : Option.none();
-        const shardName = Option.isSome(application)
-          ? yield* randomConnectionShardName(application.value.appId)
-          : "invalid:connection:0";
         const source = request.source;
         if (!(source instanceof Request)) {
           return HttpServerResponse.text("WebSocket request source is unavailable", {
             status: 500,
           });
         }
+        if (Option.isSome(application)) {
+          return yield* routeConnection(request, source, application.value);
+        }
+        const shardName = "invalid:connection:0";
         const routedRequest = yield* Effect.sync(() =>
           HttpServerRequest.fromWeb(
             new Request(source, {
@@ -255,12 +360,7 @@ export const PusherWorkerLive = PusherWorker.make(
             }),
           ),
         );
-        const connection = Option.isSome(application)
-          ? yield* placedConnections
-              .getByName(shardName, placementOf(application.value))
-              .pipe(actorApiError)
-          : connections.getByName(shardName);
-        return yield* connection.fetch(routedRequest).pipe(actorApiError);
+        return yield* connections.getByName(shardName).fetch(routedRequest).pipe(actorApiError);
       }
       return yield* http.handle(request);
     });

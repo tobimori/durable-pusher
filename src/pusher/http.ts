@@ -277,12 +277,17 @@ export const makePusherHttp = Effect.gen(function* () {
     const placement = placementOf(application);
     const encodedPlacement =
       yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
-    const result = yield* Effect.gen(function* () {
+    return yield* Effect.gen(function* () {
       const channel = yield* channelShards.getByName(
         channelShardName(application.appId, event.channel),
         placement,
       );
-      return yield* channel.publish(
+      const requestedInfo = new Set(event.info?.split(",") ?? []);
+      const info =
+        requestedInfo.has("subscription_count") || requestedInfo.has("user_count")
+          ? yield* channel.info(encodedPlacement, event.channel)
+          : undefined;
+      yield* channel.publish(
         encodedPlacement,
         event.channel,
         event.name,
@@ -291,8 +296,8 @@ export const makePusherHttp = Effect.gen(function* () {
         null,
         true,
       );
+      return info === undefined ? {} : infoAttributes(event.info, info);
     }).pipe(actorApiError);
-    return infoAttributes(event.info, result);
   });
 
   const postEvents = Effect.fn("PusherHttp.postEvents")(function* (
@@ -314,14 +319,17 @@ export const makePusherHttp = Effect.gen(function* () {
       return yield* apiError(400, "Encrypted events can target only one channel");
     }
 
-    const results = yield* Effect.forEach(channels, (channel) =>
-      publishOne(application, {
-        channel,
-        data: event.data,
-        name: event.name,
-        ...(event.info === undefined ? {} : { info: event.info }),
-        ...(event.socket_id === undefined ? {} : { socket_id: event.socket_id }),
-      }),
+    const results = yield* Effect.forEach(
+      channels,
+      (channel) =>
+        publishOne(application, {
+          channel,
+          data: event.data,
+          name: event.name,
+          ...(event.info === undefined ? {} : { info: event.info }),
+          ...(event.socket_id === undefined ? {} : { socket_id: event.socket_id }),
+        }),
+      { concurrency: 1 },
     );
     if (event.info === undefined) {
       return yield* json({});
@@ -341,8 +349,10 @@ export const makePusherHttp = Effect.gen(function* () {
     if (request.batch.length === 0 || request.batch.length > 10) {
       return yield* apiError(400, "A batch must contain between 1 and 10 events");
     }
-    const attributes = yield* Effect.forEach(request.batch, (event) =>
-      publishOne(application, event),
+    const attributes = yield* Effect.forEach(
+      request.batch,
+      (event) => publishOne(application, event),
+      { concurrency: 1 },
     );
     if (request.batch.some((event) => event.info !== undefined)) {
       return yield* json({ batch: attributes });
@@ -377,8 +387,31 @@ export const makePusherHttp = Effect.gen(function* () {
       .sort((left, right) =>
         left.channel < right.channel ? -1 : left.channel > right.channel ? 1 : 0,
       );
+    const resolvedEntries =
+      fields.size === 0
+        ? entries
+        : yield* Effect.forEach(
+            entries,
+            Effect.fn("PusherHttp.listChannels.info")(function* (entry) {
+              const placement = placementOf(application);
+              const channel = yield* channelShards.getByName(
+                channelShardName(application.appId, entry.channel),
+                placement,
+              );
+              const info = yield* channel.info(
+                yield* Schema.encodeEffect(ApplicationPlacement)(placement),
+                entry.channel,
+              );
+              return {
+                channel: entry.channel,
+                subscriptionCount: info.subscriptionCount,
+                userCount: info.userCount,
+              };
+            }),
+            { concurrency: 8 },
+          ).pipe(actorApiError);
     const channels = Object.fromEntries(
-      entries.map((entry) => [
+      resolvedEntries.map((entry) => [
         entry.channel,
         {
           ...(fields.has("subscription_count")

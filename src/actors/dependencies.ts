@@ -4,29 +4,33 @@ import {
   AppRegistry,
   ChannelDirectoryShard,
   ChannelShard,
+  ConnectionShardCatalog,
   ConnectionShard,
-  FanoutShard,
+  FanoutRelay,
   UserShard,
 } from "./contracts.ts";
 import type { PlacedNamespace } from "./placement.ts";
 
 type AppRegistryNamespace = Effect.Success<typeof AppRegistry>;
 type ChannelNamespace = Effect.Success<typeof ChannelShard>;
+type CatalogNamespace = Effect.Success<typeof ConnectionShardCatalog>;
 type ConnectionNamespace = Effect.Success<typeof ConnectionShard>;
 type DirectoryNamespace = Effect.Success<typeof ChannelDirectoryShard>;
-type FanoutNamespace = Effect.Success<typeof FanoutShard>;
+type RelayNamespace = Effect.Success<typeof FanoutRelay>;
 type UserNamespace = Effect.Success<typeof UserShard>;
 type ChannelStub = ReturnType<ChannelNamespace["getByName"]>;
+type CatalogStub = ReturnType<CatalogNamespace["getByName"]>;
 type ConnectionStub = ReturnType<ConnectionNamespace["getByName"]>;
 type DirectoryStub = ReturnType<DirectoryNamespace["getByName"]>;
-type FanoutStub = ReturnType<FanoutNamespace["getByName"]>;
+type RelayStub = ReturnType<RelayNamespace["getByName"]>;
 type UserStub = ReturnType<UserNamespace["getByName"]>;
 
 export class ChannelActorDependencies extends Context.Service<
   ChannelActorDependencies,
   {
+    readonly connections: PlacedNamespace<ConnectionStub>;
     readonly directories: PlacedNamespace<DirectoryStub>;
-    readonly fanouts: PlacedNamespace<FanoutStub>;
+    readonly relays: PlacedNamespace<RelayStub>;
   }
 >()("durable-pusher/actors/ChannelActorDependencies") {}
 
@@ -35,22 +39,25 @@ export class ConnectionActorDependencies extends Context.Service<
   {
     readonly applications: AppRegistryNamespace;
     readonly channels: PlacedNamespace<ChannelStub>;
-    readonly fanouts: PlacedNamespace<FanoutStub>;
+    readonly connectionShardSoftLimit: number;
     readonly users: PlacedNamespace<UserStub>;
   }
 >()("durable-pusher/actors/ConnectionActorDependencies") {}
 
-export class FanoutActorDependencies extends Context.Service<
-  FanoutActorDependencies,
+export class FanoutRelayDependencies extends Context.Service<
+  FanoutRelayDependencies,
   {
-    readonly channels: PlacedNamespace<ChannelStub>;
     readonly connections: PlacedNamespace<ConnectionStub>;
+    readonly relays: PlacedNamespace<RelayStub>;
   }
->()("durable-pusher/actors/FanoutActorDependencies") {}
+>()("durable-pusher/actors/FanoutRelayDependencies") {}
 
 export class UserActorDependencies extends Context.Service<
   UserActorDependencies,
-  { readonly connections: PlacedNamespace<ConnectionStub> }
+  {
+    readonly catalogs: PlacedNamespace<CatalogStub>;
+    readonly relays: PlacedNamespace<RelayStub>;
+  }
 >()("durable-pusher/actors/UserActorDependencies") {}
 
 export class HttpActorDependencies extends Context.Service<

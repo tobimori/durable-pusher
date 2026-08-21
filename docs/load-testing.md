@@ -1,41 +1,46 @@
 # Connection load testing
 
-The connection load smoke test opens 1,000 WebSockets by default and retains all of them
-concurrently. It assigns the clients to presence channels of up to 100 members, authenticates and
-subscribes every client, holds them idle, then makes every client send one `client-*` event. Every
-other member of that presence channel must receive the event before the test passes.
+By default, the load smoke test opens 1,000 WebSockets. The test keeps all sockets open at the same
+time. It puts the clients in presence channels. You can set the number of clients in each channel.
 
-The default ten rooms produce 99,000 verified peer deliveries. Rooms are capped at 100 unique users
-to preserve Pusher Channels presence compatibility. All 1,000 sockets remain connected while the
-rooms exchange events sequentially, avoiding an emulator-only alarm bottleneck without reducing
-the simultaneous connection count. A staggered Pusher protocol heartbeat keeps long-running tests
-within the server's advertised activity timeout.
+The test authenticates and subscribes each client. It then keeps the clients idle for a specified
+time. Next, each client sends one `client-*` event. All other members of the channel must receive the
+event. The test fails if a member does not receive the event.
 
-Start the local stack, then run:
+The default configuration uses 10 rooms. It verifies 99,000 event deliveries. All 1,000 sockets stay
+connected during the test. The test processes one room at a time. This process prevents an alarm
+limit in the local emulator. It does not decrease the number of open connections.
+
+The test sends Pusher heartbeat messages at different times. These messages keep long tests within
+the server activity timeout.
+
+Start the local service. Then, run this command:
 
 ```sh
 PUSHER_E2E_PORT=1337 mise exec node@24 -- pnpm test:load:connections
 ```
 
-The target and load shape are configurable:
+Use these variables to set the target and load:
 
-| Variable | Default | Purpose |
-| --- | ---: | --- |
-| `PUSHER_APP_KEY` | `local-key` | Application key used by every connection |
-| `PUSHER_APP_ID` | `local-app` | Application ID used for presence authorization |
-| `PUSHER_APP_SECRET` | `local-secret` | Application secret used for presence authorization |
-| `PUSHER_E2E_HOST` | `127.0.0.1` | Target hostname |
-| `PUSHER_E2E_PORT` | `1337` | Target port |
-| `PUSHER_E2E_TLS` | `0` | Use `wss` when set to `1` |
-| `PUSHER_LOAD_CONNECTIONS` | `1000` | Simultaneous retained connections |
-| `PUSHER_LOAD_CONCURRENCY` | `100` | Maximum concurrent connection attempts |
-| `PUSHER_LOAD_CONNECT_TIMEOUT_MS` | `30000` | Establishment and subscription timeout per socket |
-| `PUSHER_LOAD_EVENT_TIMEOUT_MS` | `300000` | Timeout for each presence room's client-event exchange |
-| `PUSHER_LOAD_HEARTBEAT_SECONDS` | `60` | Interval for each connection's staggered protocol ping |
-| `PUSHER_LOAD_IDLE_SECONDS` | `5` | Idle hold before every client sends an event |
-| `PUSHER_LOAD_PRESENCE_ROOM_SIZE` | `100` | Members per presence channel, maximum 100 |
+| Variable                         |        Default | Function                                      |
+| -------------------------------- | -------------: | --------------------------------------------- |
+| `PUSHER_APP_KEY`                 |    `local-key` | Sets the application key for all connections  |
+| `PUSHER_APP_ID`                  |    `local-app` | Sets the application ID                       |
+| `PUSHER_APP_SECRET`              | `local-secret` | Sets the secret for presence authorization    |
+| `PUSHER_E2E_HOST`                |    `127.0.0.1` | Sets the target host                          |
+| `PUSHER_E2E_PORT`                |         `1337` | Sets the target port                          |
+| `PUSHER_E2E_TLS`                 |            `0` | Uses `wss` if the value is `1`                |
+| `PUSHER_LOAD_CONNECTIONS`        |         `1000` | Sets the number of open connections           |
+| `PUSHER_LOAD_CONCURRENCY`        |          `100` | Limits simultaneous connection attempts       |
+| `PUSHER_LOAD_CONNECT_TIMEOUT_MS` |        `30000` | Sets the timeout for connection and subscribe |
+| `PUSHER_LOAD_EVENT_TIMEOUT_MS`   |       `300000` | Sets the event timeout for each presence room |
+| `PUSHER_LOAD_HEARTBEAT_SECONDS`  |           `60` | Sets the heartbeat interval for each client   |
+| `PUSHER_LOAD_IDLE_SECONDS`       |            `5` | Sets the idle time before clients send events |
+| `PUSHER_LOAD_PRESENCE_ROOM_SIZE` |          `100` | Sets the number of members in a presence room |
 
-This is a repeatable load smoke test, not a capacity benchmark. Local workerd can validate the
-hibernatable WebSocket API path but cannot prove that Cloudflare evicted and later restored a
-specific Durable Object. Production limits and hibernation behavior require the same test against
-a deployed Worker with Cloudflare metrics enabled.
+Do not use this smoke test as a capacity benchmark. Local workerd can test the hibernatable WebSocket
+API. It cannot verify that Cloudflare removed and restored a specified Durable Object.
+
+A room size greater than 100 tests behavior beyond the documented Pusher presence limit. To test
+production limits and hibernation, run the test against a deployed Worker. Enable Cloudflare metrics
+for that test.

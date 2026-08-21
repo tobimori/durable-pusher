@@ -32,5 +32,17 @@ export default {
       ALTER TABLE fanout_metadata ADD COLUMN location_hint TEXT;
       CREATE TABLE user_metadata (singleton INTEGER PRIMARY KEY NOT NULL, app_id TEXT NOT NULL, user_id TEXT NOT NULL, jurisdiction TEXT, location_hint TEXT);
     `,
+    "0003_direct_gateways_and_catalog": `
+      CREATE TABLE channel_gateways (gateway_name TEXT PRIMARY KEY NOT NULL);
+      CREATE TABLE connection_shard_catalog (singleton INTEGER PRIMARY KEY NOT NULL, app_id TEXT NOT NULL, jurisdiction TEXT, location_hint TEXT, shard_count INTEGER NOT NULL);
+    `,
+    "0004_remove_persistent_realtime_state": `
+      SELECT 1;
+    `,
+    "0005_gateway_registration_tokens": `
+      ALTER TABLE channel_gateways ADD COLUMN registration_token TEXT NOT NULL DEFAULT '';
+      DELETE FROM channel_gateways;
+      DELETE FROM directory_channels;
+    `,
   },
 };

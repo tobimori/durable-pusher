@@ -226,6 +226,36 @@ describe("official Pusher clients", () => {
     }),
   );
 
+  test("broadcasts subscription count changes", () =>
+    Effect.gen(function* () {
+      const server = yield* makeServer();
+      const first = yield* makeClient(server);
+      const second = yield* makeClient(server);
+      const channelName = testChannel("subscription-count-room");
+      const firstChannel = first.subscribe(channelName);
+      const firstCount = yield* prepareEvent<{ readonly subscription_count: number }>(
+        firstChannel,
+        "pusher:subscription_count",
+      );
+      yield* waitForEvent(firstChannel, "pusher:subscription_succeeded");
+      expect(yield* firstCount).toEqual({ subscription_count: 1 });
+
+      const secondCountForFirst = yield* prepareEvent<{
+        readonly subscription_count: number;
+      }>(firstChannel, "pusher:subscription_count");
+      const secondChannel = second.subscribe(channelName);
+      yield* waitForEvent(secondChannel, "pusher:subscription_succeeded");
+      expect(yield* secondCountForFirst).toEqual({ subscription_count: 2 });
+
+      const departureCount = yield* prepareEvent<{ readonly subscription_count: number }>(
+        firstChannel,
+        "pusher:subscription_count",
+      );
+      second.unsubscribe(channelName);
+      expect(yield* departureCount).toEqual({ subscription_count: 1 });
+    }),
+  );
+
   test("tracks presence membership", () =>
     Effect.gen(function* () {
       const server = yield* makeServer();

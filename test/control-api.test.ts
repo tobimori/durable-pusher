@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import PusherClient from "pusher-js";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -61,6 +62,47 @@ const request = Effect.fn("ControlApi.request")(function* (
   };
 });
 
+const prepareConnectionEvent = Effect.fn("ControlApi.prepareConnectionEvent")(
+  (client: PusherClient, event: string) =>
+    Effect.sync(() =>
+      Effect.callback<void>((resume) => {
+        const callback = () => {
+          client.connection.unbind(event, callback);
+          resume(Effect.void);
+        };
+        client.connection.bind(event, callback);
+        return Effect.sync(() => client.connection.unbind(event, callback));
+      }).pipe(Effect.timeout("15 seconds")),
+    ),
+);
+
+const waitForDisconnection = Effect.fn("ControlApi.waitForDisconnection")((client: PusherClient) =>
+  Effect.callback<void, ControlClientError>((resume) => {
+    const interval = setInterval(() => {
+      if (client.connection.state !== "connected") {
+        clearInterval(interval);
+        clearTimeout(timeout);
+        resume(Effect.void);
+      }
+    }, 10);
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+      resume(
+        Effect.fail(
+          new ControlClientError({
+            cause: new Error("Application connection did not close"),
+            operation: "wait for application disable",
+          }),
+        ),
+      );
+    }, 5_000);
+    return Effect.sync(() => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+    });
+  }),
+);
+
 const test = it.effect.skipIf(!enabled);
 
 describe("application control API", () => {
@@ -108,6 +150,24 @@ describe("application control API", () => {
       const summary = yield* decodeApplicationSummary(getResponse.text);
       expect(summary.appKey).toBe(created.appKey);
 
+      const client = yield* Effect.acquireRelease(
+        Effect.sync(
+          () =>
+            new PusherClient(created.appKey, {
+              cluster: "mt1",
+              disableStats: true,
+              enabledTransports: ["ws"],
+              forceTLS: useTLS,
+              wsHost: host,
+              wsPort: port,
+              wssPort: port,
+            }),
+        ),
+        (value) => Effect.sync(() => value.disconnect()),
+      );
+      const connected = yield* prepareConnectionEvent(client, "connected");
+      yield* connected;
+
       const invalidPatch = yield* request("PATCH", path, Option.some('{"jurisdiction":"eu"}'));
       expect(invalidPatch.status).toBe(400);
       const emptyPatch = yield* request("PATCH", path, Option.some("{}"));
@@ -125,6 +185,8 @@ describe("application control API", () => {
       const patched = yield* decodeApplicationSummary(patchResponse.text);
       expect(patched.name).toBe("Disabled integration");
       expect(patched.status).toBe("disabled");
+      yield* waitForDisconnection(client);
+      expect(client.connection.state).not.toBe("connected");
 
       const deleteResponse = yield* request("DELETE", path);
       expect(deleteResponse.status).toBe(204);
