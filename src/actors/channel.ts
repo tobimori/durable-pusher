@@ -172,6 +172,7 @@ export const ChannelShardLive = ChannelShard.make(
         }
         const active: PresenceConnection[] = [];
         for (const connection of current) {
+          joiningPresence.delete(connection.socketId);
           if (!leavingPresence.has(connection.socketId)) {
             active.push(connection);
           }

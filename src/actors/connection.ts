@@ -678,14 +678,6 @@ export const ConnectionShardLive = ConnectionShard.make(
         const key = pendingKey(attachment.socketId, channel);
         const activated = yield* Effect.gen(function* () {
           yield* saveAttachment(socket, activeAttachment, "subscribe");
-          if (presence !== undefined) {
-            const actor = yield* channelActor(placement, channel);
-            yield* actor.settlePresence(
-              yield* encodedPlacement(placement),
-              channel,
-              attachment.socketId,
-            );
-          }
           if (cachedEvent !== null) {
             yield* send(socket, {
               channel,
