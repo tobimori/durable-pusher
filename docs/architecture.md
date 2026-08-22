@@ -106,6 +106,12 @@ value for each subscriber. The channel shard sends publish operations in sequenc
 Cache channels use a different process. The channel shard writes the latest server event before
 delivery. It sends this event to new subscribers until the event expires.
 
+Subscription count notifications run from a channel alarm. The connection shard requests an update
+and does not wait for count collection or delivery. Thus, count delivery does not call back into the
+connection request that caused it. Concurrent requests can use one notification with the latest exact
+count. Above 100 subscribers, the channel sends at most one count notification every five seconds
+while subscriptions change.
+
 ## Presence
 
 The service reads presence state from subscription attachments in registered connection shards.

@@ -764,7 +764,10 @@ export const ConnectionShardLive = ConnectionShard.make(
           addActiveChannelSocket(channel, attachment.socketId);
           if (channelType.kind !== "presence") {
             const actor = yield* channelActor(placement, channel);
-            yield* actor.broadcastSubscriptionCount(yield* encodedPlacement(placement), channel);
+            yield* actor.requestSubscriptionCountBroadcast(
+              yield* encodedPlacement(placement),
+              channel,
+            );
           }
           yield* Effect.gen(function* () {
             joiningSubscriptions.delete(key);
@@ -843,7 +846,7 @@ export const ConnectionShardLive = ConnectionShard.make(
         if (current.kind !== "presence") {
           const actor = yield* channelActor(placement, data.channel);
           const result = yield* actor
-            .broadcastSubscriptionCount(yield* encodedPlacement(placement), data.channel)
+            .requestSubscriptionCountBroadcast(yield* encodedPlacement(placement), data.channel)
             .pipe(operationError("unsubscribe"), Effect.result);
           if (Result.isFailure(result)) {
             failures.push(result.failure);
@@ -989,7 +992,10 @@ export const ConnectionShardLive = ConnectionShard.make(
           if (subscription.kind !== "presence") {
             const actor = yield* channelActor(placement, subscription.channel);
             const result = yield* actor
-              .broadcastSubscriptionCount(yield* encodedPlacement(placement), subscription.channel)
+              .requestSubscriptionCountBroadcast(
+                yield* encodedPlacement(placement),
+                subscription.channel,
+              )
               .pipe(operationError("cleanup"), Effect.result);
             if (Result.isFailure(result)) {
               failures.push(result.failure);

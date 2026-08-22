@@ -35,7 +35,7 @@ export interface ConnectionShardApi {
 }
 
 export interface ChannelShardApi {
-  readonly broadcastSubscriptionCount: (
+  readonly requestSubscriptionCountBroadcast: (
     placement: ApplicationPlacementEncoded,
     channel: string,
   ) => ActorEffect<void>;

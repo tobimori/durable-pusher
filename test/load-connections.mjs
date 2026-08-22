@@ -4,6 +4,7 @@ import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -21,6 +22,7 @@ const ServerFrame = Schema.Struct({
 });
 const EstablishedData = Schema.Struct({ socket_id: Schema.String });
 const ClientEventData = Schema.Struct({ sender: Schema.String });
+const ChannelKind = Schema.Literals(["presence", "public"]);
 const decodeServerFrame = Schema.decodeUnknownResult(Schema.fromJsonString(ServerFrame));
 const decodeEstablishedData = Schema.decodeUnknownResult(Schema.fromJsonString(EstablishedData));
 const decodeClientEventData = Schema.decodeUnknownResult(Schema.fromJsonString(ClientEventData));
@@ -32,19 +34,17 @@ const ClientFrame = Schema.Struct({
 const encodeClientFrame = Schema.encodeEffect(Schema.fromJsonString(ClientFrame));
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
 const clientEventName = "client-presence-load";
+const serverEventName = "public-load-event";
 
 const config = Config.all({
   appId: Config.string("PUSHER_APP_ID").pipe(Config.withDefault("local-app")),
   appKey: Config.string("PUSHER_APP_KEY").pipe(Config.withDefault("local-key")),
   appSecret: Config.string("PUSHER_APP_SECRET").pipe(Config.withDefault("local-secret")),
+  channelKind: Config.string("PUSHER_LOAD_CHANNEL_KIND").pipe(Config.withDefault("presence")),
   concurrency: Config.int("PUSHER_LOAD_CONCURRENCY").pipe(Config.withDefault(100)),
-  connectTimeoutMs: Config.int("PUSHER_LOAD_CONNECT_TIMEOUT_MS").pipe(
-    Config.withDefault(30_000),
-  ),
+  connectTimeoutMs: Config.int("PUSHER_LOAD_CONNECT_TIMEOUT_MS").pipe(Config.withDefault(30_000)),
   connections: Config.int("PUSHER_LOAD_CONNECTIONS").pipe(Config.withDefault(1_000)),
-  eventTimeoutMs: Config.int("PUSHER_LOAD_EVENT_TIMEOUT_MS").pipe(
-    Config.withDefault(300_000),
-  ),
+  eventTimeoutMs: Config.int("PUSHER_LOAD_EVENT_TIMEOUT_MS").pipe(Config.withDefault(300_000)),
   heartbeatSeconds: Config.int("PUSHER_LOAD_HEARTBEAT_SECONDS").pipe(Config.withDefault(60)),
   host: Config.string("PUSHER_E2E_HOST").pipe(Config.withDefault("127.0.0.1")),
   idleSeconds: Config.int("PUSHER_LOAD_IDLE_SECONDS").pipe(Config.withDefault(5)),
@@ -149,24 +149,22 @@ const waitForEstablished = Effect.fn("ConnectionLoad.waitForEstablished")(
     }),
 );
 
-const openConnection = Effect.fn("ConnectionLoad.openConnection")(function* (
-  url,
-  connection,
-  timeoutMs,
-) {
-  const socket = yield* Effect.try({
-    try: () => new WebSocket(url),
-    catch: (cause) => loadError(connection, "connect", String(cause)),
-  });
-  const socketId = yield* waitForEstablished(socket, connection, timeoutMs).pipe(
-    Effect.onError(() =>
-      Effect.sync(() => {
-        socket.close();
-      }),
-    ),
-  );
-  return { connection, socket, socketId };
-});
+const openConnection = Effect.fn("ConnectionLoad.openConnection")(
+  function* (url, connection, timeoutMs) {
+    const socket = yield* Effect.try({
+      try: () => new WebSocket(url),
+      catch: (cause) => loadError(connection, "connect", String(cause)),
+    });
+    const socketId = yield* waitForEstablished(socket, connection, timeoutMs).pipe(
+      Effect.onError(() =>
+        Effect.sync(() => {
+          socket.close();
+        }),
+      ),
+    );
+    return { connection, socket, socketId };
+  },
+);
 
 const closeConnections = Effect.fn("ConnectionLoad.closeConnections")((connections) =>
   Effect.sync(() => {
@@ -178,96 +176,92 @@ const closeConnections = Effect.fn("ConnectionLoad.closeConnections")((connectio
   }),
 );
 
-const keepConnectionsAlive = Effect.fn("ConnectionLoad.keepConnectionsAlive")(
-  (connections, pingFrame, heartbeatSeconds) => {
-    const batchSize = 50;
-    const batches = Array.from(
-      { length: Math.ceil(connections.length / batchSize) },
-      (_, index) => connections.slice(index * batchSize, (index + 1) * batchSize),
-    );
-    const delayMs = Math.max(100, Math.floor((heartbeatSeconds * 1_000) / batches.length));
-    return Effect.forEach(
-      batches,
-      (batch) =>
-        Effect.sync(() => {
-          for (const { socket } of batch) {
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(pingFrame);
-            }
+const keepConnectionsAlive = Effect.fn("ConnectionLoad.keepConnectionsAlive")((
+  connections,
+  pingFrame,
+  heartbeatSeconds,
+) => {
+  const batchSize = 50;
+  const batches = Array.from({ length: Math.ceil(connections.length / batchSize) }, (_, index) =>
+    connections.slice(index * batchSize, (index + 1) * batchSize),
+  );
+  const delayMs = Math.max(100, Math.floor((heartbeatSeconds * 1_000) / batches.length));
+  return Effect.forEach(
+    batches,
+    (batch) =>
+      Effect.sync(() => {
+        for (const { socket } of batch) {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(pingFrame);
           }
-        }).pipe(Effect.andThen(Effect.sleep(Duration.millis(delayMs)))),
-      { discard: true },
-    );
-  },
-);
-
-const subscribePresence = Effect.fn("ConnectionLoad.subscribePresence")(
-  (session, frame, timeoutMs) =>
-    Effect.callback((resume) => {
-      let settled = false;
-      const finish = (effect) => {
-        if (settled) {
-          return;
         }
-        settled = true;
-        clearTimeout(timeout);
-        session.socket.removeEventListener("close", onClose);
-        session.socket.removeEventListener("error", onError);
-        session.socket.removeEventListener("message", onMessage);
-        resume(effect);
-      };
-      const onClose = (event) =>
+      }).pipe(Effect.andThen(Effect.sleep(Duration.millis(delayMs)))),
+    { discard: true },
+  );
+});
+
+const subscribeChannel = Effect.fn("ConnectionLoad.subscribeChannel")((session, frame, timeoutMs) =>
+  Effect.callback((resume) => {
+    let settled = false;
+    const finish = (effect) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      session.socket.removeEventListener("close", onClose);
+      session.socket.removeEventListener("error", onError);
+      session.socket.removeEventListener("message", onMessage);
+      resume(effect);
+    };
+    const onClose = (event) =>
+      finish(
+        Effect.fail(
+          loadError(
+            session.connection,
+            "subscribe",
+            `socket closed before subscription (${event.code}: ${event.reason})`,
+          ),
+        ),
+      );
+    const onError = () =>
+      finish(Effect.fail(loadError(session.connection, "subscribe", "subscription failed")));
+    const onMessage = (event) => {
+      const decoded = decodeServerFrame(event.data);
+      if (Result.isFailure(decoded)) {
+        return;
+      }
+      if (decoded.success.event === "pusher:error") {
+        finish(
+          Effect.fail(loadError(session.connection, "subscribe", "server rejected subscription")),
+        );
+      } else if (
+        decoded.success.event === "pusher_internal:subscription_succeeded" &&
+        decoded.success.channel === session.channel
+      ) {
+        finish(Effect.void);
+      }
+    };
+    const timeout = setTimeout(
+      () =>
         finish(
           Effect.fail(
-            loadError(
-              session.connection,
-              "subscribe",
-              `socket closed before subscription (${event.code}: ${event.reason})`,
-            ),
+            loadError(session.connection, "subscribe", `timed out after ${timeoutMs} milliseconds`),
           ),
-        );
-      const onError = () =>
-        finish(
-          Effect.fail(loadError(session.connection, "subscribe", "presence subscription failed")),
-        );
-      const onMessage = (event) => {
-        const decoded = decodeServerFrame(event.data);
-        if (Result.isFailure(decoded)) {
-          return;
-        }
-        if (decoded.success.event === "pusher:error") {
-          finish(
-            Effect.fail(
-              loadError(session.connection, "subscribe", "server rejected presence subscription"),
-            ),
-          );
-        } else if (
-          decoded.success.event === "pusher_internal:subscription_succeeded" &&
-          decoded.success.channel === session.channel
-        ) {
-          finish(Effect.void);
-        }
-      };
-      const timeout = setTimeout(
-        () =>
-          finish(
-            Effect.fail(
-              loadError(session.connection, "subscribe", `timed out after ${timeoutMs} milliseconds`),
-            ),
-          ),
-        timeoutMs,
-      );
-      session.socket.addEventListener("close", onClose);
-      session.socket.addEventListener("error", onError);
-      session.socket.addEventListener("message", onMessage);
-      session.socket.send(frame);
-      return Effect.sync(() => {
-        clearTimeout(timeout);
-        session.socket.removeEventListener("close", onClose);
-        session.socket.removeEventListener("error", onError);
-        session.socket.removeEventListener("message", onMessage);
-      });
-    }),
+        ),
+      timeoutMs,
+    );
+    session.socket.addEventListener("close", onClose);
+    session.socket.addEventListener("error", onError);
+    session.socket.addEventListener("message", onMessage);
+    session.socket.send(frame);
+    return Effect.sync(() => {
+      clearTimeout(timeout);
+      session.socket.removeEventListener("close", onClose);
+      session.socket.removeEventListener("error", onError);
+      session.socket.removeEventListener("message", onMessage);
+    });
+  }),
 );
 
 const joinPresence = Effect.fn("ConnectionLoad.joinPresence")(
@@ -292,8 +286,130 @@ const joinPresence = Effect.fn("ConnectionLoad.joinPresence")(
         loadError(session.connection, "subscribe", "could not encode subscription frame"),
       ),
     );
-    yield* subscribePresence(session, frame, timeoutMs);
+    yield* subscribeChannel(session, frame, timeoutMs);
   },
+);
+
+const joinPublic = Effect.fn("ConnectionLoad.joinPublic")(function* (session, timeoutMs) {
+  const frame = yield* encodeClientFrame({
+    data: { channel: session.channel },
+    event: "pusher:subscribe",
+  }).pipe(
+    Effect.mapError(() =>
+      loadError(session.connection, "subscribe", "could not encode subscription frame"),
+    ),
+  );
+  yield* subscribeChannel(session, frame, timeoutMs);
+});
+
+const prepareServerDeliveries = Effect.fn("ConnectionLoad.prepareServerDeliveries")(
+  (sessions, timeoutMs) =>
+    Effect.sync(() => {
+      let completed = 0;
+      let completion = null;
+      let resumeWait = null;
+      let settled = false;
+      const listeners = [];
+      const cleanup = () => {
+        clearTimeout(timeout);
+        for (const { onClose, onError, onMessage, session } of listeners) {
+          session.socket.removeEventListener("close", onClose);
+          session.socket.removeEventListener("error", onError);
+          session.socket.removeEventListener("message", onMessage);
+        }
+      };
+      const finish = (effect) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        if (resumeWait === null) {
+          completion = effect;
+        } else {
+          resumeWait(effect);
+        }
+      };
+
+      for (const session of sessions) {
+        let received = false;
+        const onClose = (event) =>
+          finish(
+            Effect.fail(
+              loadError(
+                session.connection,
+                "server event",
+                `socket closed during delivery (${event.code}: ${event.reason})`,
+              ),
+            ),
+          );
+        const onError = () =>
+          finish(
+            Effect.fail(loadError(session.connection, "server event", "server delivery failed")),
+          );
+        const onMessage = (event) => {
+          const decoded = decodeServerFrame(event.data);
+          if (Result.isFailure(decoded)) {
+            return;
+          }
+          if (decoded.success.event === "pusher:error") {
+            finish(
+              Effect.fail(
+                loadError(session.connection, "server event", "server rejected the event"),
+              ),
+            );
+            return;
+          }
+          if (
+            received ||
+            decoded.success.event !== serverEventName ||
+            decoded.success.channel !== session.channel
+          ) {
+            return;
+          }
+          received = true;
+          completed += 1;
+          if (completed === sessions.length) {
+            finish(Effect.void);
+          }
+        };
+        listeners.push({ onClose, onError, onMessage, session });
+        session.socket.addEventListener("close", onClose);
+        session.socket.addEventListener("error", onError);
+        session.socket.addEventListener("message", onMessage);
+      }
+
+      const timeout = setTimeout(
+        () =>
+          finish(
+            Effect.fail(
+              loadError(
+                0,
+                "server event",
+                `timed out after ${timeoutMs} milliseconds (${completed}/${sessions.length} deliveries received)`,
+              ),
+            ),
+          ),
+        timeoutMs,
+      );
+
+      return Effect.callback((resume) => {
+        if (completion === null) {
+          resumeWait = resume;
+        } else {
+          resume(completion);
+        }
+        return Effect.sync(cleanup);
+      });
+    }),
+);
+
+const triggerServerEvent = Effect.fn("ConnectionLoad.triggerServerEvent")(
+  (server, channel, runId) =>
+    Effect.tryPromise({
+      try: () => server.trigger(channel, serverEventName, { runId }),
+      catch: (cause) => loadError(0, "server event", String(cause)),
+    }),
 );
 
 const exchangeClientEvents = Effect.fn("ConnectionLoad.exchangeClientEvents")(
@@ -400,31 +516,28 @@ const exchangeClientEvents = Effect.fn("ConnectionLoad.exchangeClientEvents")(
         session.socket.addEventListener("message", onMessage);
       }
 
-      const timeout = setTimeout(
-        () => {
-          const incomplete = sessions.find((session) => {
-            const received = receivedByConnection.get(session.connection)?.size ?? 0;
-            const expected = (roomMembers.get(session.channel)?.size ?? 1) - 1;
-            return received !== expected;
-          });
-          const received =
-            incomplete === undefined
-              ? 0
-              : (receivedByConnection.get(incomplete.connection)?.size ?? 0);
-          const expected =
-            incomplete === undefined ? 0 : (roomMembers.get(incomplete.channel)?.size ?? 1) - 1;
-          finish(
-            Effect.fail(
-              loadError(
-                incomplete?.connection ?? 0,
-                "client event",
-                `timed out after ${timeoutMs} milliseconds (${received}/${expected} peer events received)`,
-              ),
+      const timeout = setTimeout(() => {
+        const incomplete = sessions.find((session) => {
+          const received = receivedByConnection.get(session.connection)?.size ?? 0;
+          const expected = (roomMembers.get(session.channel)?.size ?? 1) - 1;
+          return received !== expected;
+        });
+        const received =
+          incomplete === undefined
+            ? 0
+            : (receivedByConnection.get(incomplete.connection)?.size ?? 0);
+        const expected =
+          incomplete === undefined ? 0 : (roomMembers.get(incomplete.channel)?.size ?? 1) - 1;
+        finish(
+          Effect.fail(
+            loadError(
+              incomplete?.connection ?? 0,
+              "client event",
+              `timed out after ${timeoutMs} milliseconds (${received}/${expected} peer events received)`,
             ),
-          );
-        },
-        timeoutMs,
-      );
+          ),
+        );
+      }, timeoutMs);
 
       if (completed === sessions.length) {
         finish(Effect.void);
@@ -441,6 +554,11 @@ const exchangeClientEvents = Effect.fn("ConnectionLoad.exchangeClientEvents")(
 const program = Effect.scoped(
   Effect.gen(function* () {
     const settings = yield* config;
+    const channelKind = yield* Schema.decodeEffect(ChannelKind)(settings.channelKind).pipe(
+      Effect.mapError(() =>
+        loadError(0, "configuration", "PUSHER_LOAD_CHANNEL_KIND must be presence or public"),
+      ),
+    );
     const connectionCount = yield* positiveInt("PUSHER_LOAD_CONNECTIONS", settings.connections);
     const concurrency = yield* positiveInt("PUSHER_LOAD_CONCURRENCY", settings.concurrency);
     const connectTimeoutMs = yield* positiveInt(
@@ -482,7 +600,12 @@ const program = Effect.scoped(
       connectionIndexes,
       (connection) =>
         openConnection(url, connection, connectTimeoutMs).pipe(
-          Effect.tap((opened) => Ref.update(openedConnections, (current) => [...current, opened])),
+          Effect.tap((opened) =>
+            Ref.update(openedConnections, (current) => {
+              current.push(opened);
+              return current;
+            }),
+          ),
         ),
       { concurrency },
     );
@@ -502,9 +625,13 @@ const program = Effect.scoped(
       const room = Math.floor(index / roomSize) + 1;
       const session = {
         ...connection,
-        channel: `presence-load-${runId}-${room}`,
+        channel:
+          channelKind === "public" ? `public-load-${runId}` : `presence-load-${runId}-${room}`,
         userId: `load-user-${runId}-${connection.connection}`,
       };
+      if (channelKind === "public") {
+        return Effect.succeed(session);
+      }
       return encodeClientFrame({
         channel: session.channel,
         data: { sender: session.userId },
@@ -524,47 +651,59 @@ const program = Effect.scoped(
     }
 
     yield* Effect.logInfo(
-      `Joining ${sessions.length} clients to ${roomMembers.size} presence channels`,
+      `Joining ${sessions.length} clients to ${roomMembers.size} ${channelKind} channels`,
     );
     yield* Effect.forEach(
       sessions,
-      (session) => joinPresence(server, session, connectTimeoutMs),
+      (session) =>
+        channelKind === "public"
+          ? joinPublic(session, connectTimeoutMs)
+          : joinPresence(server, session, connectTimeoutMs),
       { concurrency, discard: true },
     );
     const subscribedAt = yield* Clock.currentTimeMillis;
     yield* Effect.logInfo(
-      `${sessions.length} presence subscriptions active in ${subscribedAt - connectedAt} milliseconds`,
+      `${sessions.length} ${channelKind} subscriptions active in ${subscribedAt - connectedAt} milliseconds`,
     );
 
     yield* Effect.logInfo("Holding all connections idle", { idleSeconds });
     yield* Effect.sleep(Duration.seconds(idleSeconds));
-    const expectedDeliveries = Array.from(roomMembers.values()).reduce(
-      (total, members) => total + members.size * (members.size - 1),
-      0,
-    );
     const exchangeStartedAt = yield* Clock.currentTimeMillis;
-    yield* Effect.logInfo(
-      `Sending one client event per connection and expecting ${expectedDeliveries} peer deliveries`,
-    );
-    let roomNumber = 0;
-    for (const [channel, members] of roomMembers) {
-      roomNumber += 1;
-      const roomSessions = sessions.filter((session) => session.channel === channel);
+    let expectedDeliveries;
+    if (channelKind === "public") {
+      expectedDeliveries = sessions.length;
+      const deliveries = yield* prepareServerDeliveries(sessions, eventTimeoutMs);
+      const deliveryFiber = yield* deliveries.pipe(Effect.forkScoped);
+      const channel = `public-load-${runId}`;
       yield* Effect.logInfo(
-        `Exchanging ${members.size * (members.size - 1)} peer deliveries in room ${roomNumber}/${roomMembers.size}`,
+        `Sending one server event and expecting ${expectedDeliveries} public deliveries`,
       );
-      yield* exchangeClientEvents(
-        roomSessions,
-        new Map([[channel, members]]),
-        eventTimeoutMs,
+      yield* triggerServerEvent(server, channel, runId);
+      yield* Fiber.join(deliveryFiber);
+    } else {
+      expectedDeliveries = Array.from(roomMembers.values()).reduce(
+        (total, members) => total + members.size * (members.size - 1),
+        0,
       );
+      yield* Effect.logInfo(
+        `Sending one client event per connection and expecting ${expectedDeliveries} peer deliveries`,
+      );
+      let roomNumber = 0;
+      for (const [channel, members] of roomMembers) {
+        roomNumber += 1;
+        const roomSessions = sessions.filter((session) => session.channel === channel);
+        yield* Effect.logInfo(
+          `Exchanging ${members.size * (members.size - 1)} peer deliveries in room ${roomNumber}/${roomMembers.size}`,
+        );
+        yield* exchangeClientEvents(roomSessions, new Map([[channel, members]]), eventTimeoutMs);
+      }
     }
     const completedAt = yield* Clock.currentTimeMillis;
     yield* Effect.logInfo(
       `${expectedDeliveries} peer deliveries received in ${completedAt - exchangeStartedAt} milliseconds`,
     );
     yield* Effect.logInfo(
-      `Presence connection load test passed in ${completedAt - startedAt} milliseconds`,
+      `${channelKind} connection load test passed in ${completedAt - startedAt} milliseconds`,
     );
   }),
 );

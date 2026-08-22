@@ -1,5 +1,7 @@
+import * as Cloudflare from "alchemy/Cloudflare";
 import * as Drizzle from "alchemy/Drizzle/Cloudflare";
 import { and, count, eq } from "drizzle-orm";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
@@ -9,6 +11,7 @@ import { ApplicationPlacement, type ApplicationPlacementEncoded } from "../apps/
 import migrations from "../db/migrations.ts";
 import { cacheEvents, channelGateways, channelState } from "../db/schema.ts";
 import {
+  ActorError,
   classifyChannel,
   Delivery,
   encodeJson,
@@ -29,12 +32,32 @@ import { ChannelActorDependencies } from "./dependencies.ts";
 export { ChannelShard };
 
 const CACHE_RETENTION_MS = 30 * 60_000;
+const COUNT_BROADCAST_INTERVAL_MS = 5_000;
+const COUNT_CHECKPOINT_KEY = "subscription-count-checkpoint";
+const COUNT_LARGE_CHANNEL_THRESHOLD = 100;
+const IDENTITY_KEY = "channel-identity";
+
+const ChannelIdentity = Schema.Struct({
+  ...ApplicationPlacement.fields,
+  channel: Schema.String,
+});
+type ChannelIdentityEncoded = typeof ChannelIdentity.Encoded;
+
+const CountCheckpoint = Schema.Struct({
+  broadcastAt: Schema.Int,
+  count: Schema.Int,
+});
+type CountCheckpoint = typeof CountCheckpoint.Type;
 
 const operationError = (operation: string) =>
   Effect.mapError(mapActorError("ChannelShard", operation));
 
+const actorError = (operation: string, message: string): ActorError =>
+  ActorError.make({ actor: "ChannelShard", message, operation });
+
 export const ChannelShardLive = ChannelShard.make(
   Effect.gen(function* () {
+    const state = yield* Cloudflare.DurableObjectState;
     const { connections, directories, relays } = yield* ChannelActorDependencies;
 
     // Alchemy's Durable Object constructor is intentionally a two-phase Effect.
@@ -42,6 +65,20 @@ export const ChannelShardLive = ChannelShard.make(
     return Effect.gen(function* () {
       const db = yield* Drizzle.DurableObject({ migrations });
       const publicationLock = yield* Semaphore.make(1);
+      const countScheduleLock = yield* Semaphore.make(1);
+      const storedIdentity = yield* state.storage.get<unknown>(IDENTITY_KEY);
+      let channelIdentity: ChannelIdentityEncoded | undefined =
+        storedIdentity === undefined
+          ? undefined
+          : yield* Schema.decodeUnknownEffect(ChannelIdentity)(storedIdentity).pipe(
+              Effect.flatMap(Schema.encodeEffect(ChannelIdentity)),
+              Effect.orDie,
+            );
+      const storedCheckpoint = yield* state.storage.get<unknown>(COUNT_CHECKPOINT_KEY);
+      let countCheckpoint: CountCheckpoint | undefined =
+        storedCheckpoint === undefined
+          ? undefined
+          : yield* Schema.decodeUnknownEffect(CountCheckpoint)(storedCheckpoint).pipe(Effect.orDie);
       const incarnation = yield* Effect.gen(function* () {
         const [previousState] = yield* db
           .select({ incarnation: channelState.incarnation })
@@ -61,6 +98,27 @@ export const ChannelShardLive = ChannelShard.make(
       let sequence = 0;
       const joiningPresence = new Map<string, PresenceConnection>();
       const leavingPresence = new Set<string>();
+
+      const ensureIdentity = Effect.fn("ChannelShard.ensureIdentity")(function* (
+        placement: ApplicationPlacementEncoded,
+        channel: string,
+      ) {
+        const decoded = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
+        const next = yield* Schema.encodeEffect(ChannelIdentity)({ ...decoded, channel });
+        if (channelIdentity === undefined) {
+          yield* state.storage.put(IDENTITY_KEY, next);
+          channelIdentity = next;
+          return;
+        }
+        if (
+          channelIdentity.appId !== next.appId ||
+          channelIdentity.channel !== next.channel ||
+          channelIdentity.jurisdiction !== next.jurisdiction ||
+          channelIdentity.locationHint !== next.locationHint
+        ) {
+          return yield* actorError("ensureIdentity", "Channel identity mismatch");
+        }
+      });
 
       const summarizePresence = (connections: ReadonlyArray<PresenceConnection>) => {
         const members = new Map<string, PresenceMember>();
@@ -560,21 +618,97 @@ export const ChannelShardLive = ChannelShard.make(
         ).pipe(Semaphore.withPermit(publicationLock));
       }, operationError("publish"));
 
-      const broadcastSubscriptionCount = Effect.fn("ChannelShard.broadcastSubscriptionCount")(
+      const requestSubscriptionCountBroadcast = Effect.fn(
+        "ChannelShard.requestSubscriptionCountBroadcast",
+      )(
         (placement: ApplicationPlacementEncoded, channel: string) =>
           Effect.gen(function* () {
-            const decoded = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
-            yield* deliver(
-              decoded,
-              channel,
-              "pusher_internal:subscription_count",
-              yield* encodeJson({ subscription_count: yield* queryCounts(decoded, channel) }),
-              null,
-              null,
-            );
-          }).pipe(Semaphore.withPermit(publicationLock)),
-        operationError("broadcastSubscriptionCount"),
+            yield* ensureIdentity(placement, channel);
+            const now = yield* Clock.currentTimeMillis;
+            const requestedAt =
+              countCheckpoint !== undefined && countCheckpoint.count > COUNT_LARGE_CHANNEL_THRESHOLD
+                ? Math.max(now, countCheckpoint.broadcastAt + COUNT_BROADCAST_INTERVAL_MS)
+                : now;
+            const scheduledAt = yield* state.storage.getAlarm();
+            if (scheduledAt === null || requestedAt < scheduledAt) {
+              yield* state.storage.setAlarm(requestedAt);
+            }
+          }).pipe(Semaphore.withPermit(countScheduleLock)),
+        operationError("requestSubscriptionCountBroadcast"),
       );
+
+      const alarm = () =>
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const deferredUntil =
+            countCheckpoint !== undefined && countCheckpoint.count > COUNT_LARGE_CHANNEL_THRESHOLD
+              ? countCheckpoint.broadcastAt + COUNT_BROADCAST_INTERVAL_MS
+              : now;
+          if (now < deferredUntil) {
+            yield* state.storage.setAlarm(deferredUntil);
+            return;
+          }
+
+          const identity = channelIdentity;
+          if (identity === undefined) {
+            return yield* actorError("alarm", "Channel identity is missing");
+          }
+          const decoded = yield* Schema.decodeEffect(ChannelIdentity)(identity);
+          const placement: ApplicationPlacement = {
+            appId: decoded.appId,
+            jurisdiction: decoded.jurisdiction,
+            locationHint: decoded.locationHint,
+          };
+          const subscriptionCount = yield* queryCounts(placement, decoded.channel);
+          yield* deliver(
+            placement,
+            decoded.channel,
+            "pusher_internal:subscription_count",
+            yield* encodeJson({ subscription_count: subscriptionCount }),
+            null,
+            null,
+          );
+          const broadcastAt = yield* Clock.currentTimeMillis;
+
+          yield* Effect.gen(function* () {
+            if (subscriptionCount > COUNT_LARGE_CHANNEL_THRESHOLD) {
+              const checkpoint = { broadcastAt, count: subscriptionCount };
+              yield* state.storage.put(COUNT_CHECKPOINT_KEY, checkpoint);
+              countCheckpoint = checkpoint;
+            } else if (countCheckpoint !== undefined) {
+              yield* state.storage.delete(COUNT_CHECKPOINT_KEY);
+              countCheckpoint = undefined;
+            }
+
+            const pendingAt = yield* state.storage.getAlarm();
+            if (pendingAt !== null) {
+              const nextAt =
+                subscriptionCount > COUNT_LARGE_CHANNEL_THRESHOLD
+                  ? broadcastAt + COUNT_BROADCAST_INTERVAL_MS
+                  : broadcastAt;
+              if (pendingAt !== nextAt) {
+                yield* state.storage.setAlarm(nextAt);
+              }
+            }
+          }).pipe(Semaphore.withPermit(countScheduleLock));
+        }).pipe(
+          Semaphore.withPermit(publicationLock),
+          operationError("alarm"),
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* state.storage.setAlarm(
+                (yield* Clock.currentTimeMillis) + COUNT_BROADCAST_INTERVAL_MS,
+              );
+              yield* Effect.logWarning("Channel subscription-count alarm failed").pipe(
+                Effect.annotateLogs({
+                  actor: "ChannelShard",
+                  error: Cause.pretty(cause),
+                  operation: "alarm",
+                }),
+              );
+            }),
+          ),
+        );
 
       const info = Effect.fn("ChannelShard.info")(function* (
         placement: ApplicationPlacementEncoded,
@@ -598,17 +732,17 @@ export const ChannelShardLive = ChannelShard.make(
       }, operationError("presenceUsers"));
 
       const api = {
-        broadcastSubscriptionCount,
         info,
         joinPresence,
         leavePresence,
         presenceUsers,
         publish,
         registerGateway,
+        requestSubscriptionCountBroadcast,
         snapshot,
         unregisterGateway,
       } satisfies ChannelShardApi;
-      return api;
+      return { ...api, alarm };
     });
   }),
 );
