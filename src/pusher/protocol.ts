@@ -84,6 +84,7 @@ export const PublishedEvent = Schema.Struct({
 export const Delivery = Schema.Struct({
   ...PublishedEvent.fields,
   ...ApplicationPlacement.fields,
+  incarnation: Schema.Int,
   sequence: Schema.Int,
 });
 
@@ -96,6 +97,7 @@ export const CachedEvent = Schema.Struct({
 export const ChannelSnapshot = Schema.Struct({
   barrier: Schema.Int,
   cache: Schema.NullOr(CachedEvent),
+  incarnation: Schema.Int,
 });
 
 export const PresenceMember = Schema.Struct({
@@ -110,12 +112,14 @@ export const PresenceConnection = Schema.Struct({
 
 export const PresenceSnapshot = Schema.Struct({
   barrier: Schema.Int,
+  incarnation: Schema.Int,
   members: Schema.Array(PresenceMember),
 });
 
 export const PresenceJoin = Schema.Struct({
   ...ApplicationPlacement.fields,
   channel: Schema.String,
+  gatewayName: Schema.String,
   socketId: Schema.String,
   userId: Schema.String,
   userInfo: Schema.Json,

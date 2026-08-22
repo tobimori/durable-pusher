@@ -7,7 +7,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { ApplicationPlacement, type ApplicationPlacementEncoded } from "../apps/model.ts";
 import migrations from "../db/migrations.ts";
-import { cacheEvents, channelGateways } from "../db/schema.ts";
+import { cacheEvents, channelGateways, channelState } from "../db/schema.ts";
 import {
   classifyChannel,
   Delivery,
@@ -42,6 +42,22 @@ export const ChannelShardLive = ChannelShard.make(
     return Effect.gen(function* () {
       const db = yield* Drizzle.DurableObject({ migrations });
       const publicationLock = yield* Semaphore.make(1);
+      const incarnation = yield* Effect.gen(function* () {
+        const [previousState] = yield* db
+          .select({ incarnation: channelState.incarnation })
+          .from(channelState)
+          .where(eq(channelState.singleton, 1))
+          .limit(1);
+        const next = (previousState?.incarnation ?? 0) + 1;
+        yield* db
+          .insert(channelState)
+          .values({ incarnation: next, singleton: 1 })
+          .onConflictDoUpdate({
+            set: { incarnation: next },
+            target: channelState.singleton,
+          });
+        return next;
+      }).pipe(Effect.orDie);
       let sequence = 0;
       const joiningPresence = new Map<string, PresenceConnection>();
       const leavingPresence = new Set<string>();
@@ -170,8 +186,10 @@ export const ChannelShardLive = ChannelShard.make(
             current.push(...result);
           }
         }
+        const observed = new Set<string>();
         const active: PresenceConnection[] = [];
         for (const connection of current) {
+          observed.add(connection.socketId);
           joiningPresence.delete(connection.socketId);
           if (!leavingPresence.has(connection.socketId)) {
             active.push(connection);
@@ -180,6 +198,11 @@ export const ChannelShardLive = ChannelShard.make(
         for (const connection of joiningPresence.values()) {
           if (!leavingPresence.has(connection.socketId)) {
             active.push(connection);
+          }
+        }
+        for (const socketId of leavingPresence) {
+          if (!observed.has(socketId)) {
+            leavingPresence.delete(socketId);
           }
         }
         return summarizePresence(active);
@@ -258,6 +281,7 @@ export const ChannelShardLive = ChannelShard.make(
           channel,
           data,
           event,
+          incarnation,
           jurisdiction: placement.jurisdiction,
           locationHint: placement.locationHint,
           sequence,
@@ -354,6 +378,7 @@ export const ChannelShardLive = ChannelShard.make(
         return {
           barrier: sequence,
           cache: yield* getCachedEvent(),
+          incarnation,
         } satisfies ChannelSnapshot;
       });
 
@@ -462,7 +487,22 @@ export const ChannelShardLive = ChannelShard.make(
         };
         joiningPresence.set(decoded.socketId, connection);
         const presence = summarizePresence([...before.connections, connection]);
-        return { barrier: sequence, members: presence.members } satisfies PresenceSnapshot;
+        const activate = Effect.gen(function* () {
+          const gateway = yield* connections.getByName(decoded.gatewayName, placement);
+          yield* gateway.activatePresence(decoded.channel, decoded.socketId);
+        });
+        let activated = yield* activate.pipe(Effect.result);
+        if (Result.isFailure(activated)) {
+          activated = yield* activate.pipe(Effect.result);
+        }
+        if (Result.isSuccess(activated)) {
+          joiningPresence.delete(decoded.socketId);
+        }
+        return {
+          barrier: sequence,
+          incarnation,
+          members: presence.members,
+        } satisfies PresenceSnapshot;
       });
 
       const joinPresence = Effect.fn("ChannelShard.joinPresence")(
@@ -476,14 +516,27 @@ export const ChannelShardLive = ChannelShard.make(
         channel: string,
         socketId: string,
         userId: string,
+        active: boolean,
+        gatewayName: string,
       ) {
         const decoded = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
-        const before = yield* queryPresence(decoded, channel);
-        const wasPresent = before.connections.some(
-          (connection) => connection.socketId === socketId && connection.userId === userId,
-        );
-        joiningPresence.delete(socketId);
+        const wasJoining = joiningPresence.delete(socketId);
         leavingPresence.add(socketId);
+        let deactivated = false;
+        const deactivate = Effect.gen(function* () {
+          const gateway = yield* connections.getByName(gatewayName, decoded);
+          return yield* gateway.deactivatePresence(channel, socketId);
+        });
+        const first = yield* deactivate.pipe(Effect.result);
+        if (Result.isSuccess(first)) {
+          deactivated = first.success;
+        } else {
+          const second = yield* deactivate.pipe(Effect.result);
+          if (Result.isSuccess(second)) {
+            deactivated = second.success;
+          }
+        }
+        const wasPresent = wasJoining || active || deactivated;
         const presence = yield* queryPresence(decoded, channel);
         if (wasPresent && !presence.counts.has(userId)) {
           yield* publishUnlocked(
@@ -504,20 +557,13 @@ export const ChannelShardLive = ChannelShard.make(
           channel: string,
           socketId: string,
           userId: string,
+          active: boolean,
+          gatewayName: string,
         ) =>
-          leavePresenceUnlocked(placement, channel, socketId, userId).pipe(
+          leavePresenceUnlocked(placement, channel, socketId, userId, active, gatewayName).pipe(
             Semaphore.withPermit(publicationLock),
           ),
         operationError("leavePresence"),
-      );
-
-      const settlePresence = Effect.fn("ChannelShard.settlePresence")(
-        (_placement: ApplicationPlacementEncoded, _channel: string, socketId: string) =>
-          Effect.sync(() => {
-            joiningPresence.delete(socketId);
-            leavingPresence.delete(socketId);
-          }),
-        operationError("settlePresence"),
       );
 
       const publish = Effect.fn("ChannelShard.publish")(function* (
@@ -561,7 +607,10 @@ export const ChannelShardLive = ChannelShard.make(
         placement: ApplicationPlacementEncoded,
         channel: string,
       ) {
-        return yield* getInfo(yield* Schema.decodeEffect(ApplicationPlacement)(placement), channel);
+        return yield* getInfo(
+          yield* Schema.decodeEffect(ApplicationPlacement)(placement),
+          channel,
+        ).pipe(Semaphore.withPermit(publicationLock));
       }, operationError("info"));
 
       const presenceUsers = Effect.fn("ChannelShard.presenceUsers")(function* (
@@ -571,7 +620,7 @@ export const ChannelShardLive = ChannelShard.make(
         const presence = yield* queryPresence(
           yield* Schema.decodeEffect(ApplicationPlacement)(placement),
           channel,
-        );
+        ).pipe(Semaphore.withPermit(publicationLock));
         return presence.members.map((member) => member.userId);
       }, operationError("presenceUsers"));
 
@@ -583,7 +632,6 @@ export const ChannelShardLive = ChannelShard.make(
         presenceUsers,
         publish,
         registerGateway,
-        settlePresence,
         snapshot,
         unregisterGateway,
       } satisfies ChannelShardApi;

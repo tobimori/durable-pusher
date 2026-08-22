@@ -271,6 +271,12 @@ describe("official Pusher clients", () => {
       yield* waitForEvent(second.subscribe(channel), "pusher:subscription_succeeded");
       const member = yield* memberReceived;
       expect(member).toEqual({ id: "user-two", info: { name: "Two" } });
+      const memberRemoved = yield* prepareEvent<{ readonly id: string }>(
+        firstChannel,
+        "pusher:member_removed",
+      );
+      second.disconnect();
+      expect((yield* memberRemoved).id).toBe("user-two");
     }),
   );
 

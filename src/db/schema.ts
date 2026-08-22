@@ -13,6 +13,11 @@ export const channelGateways = sqliteTable("channel_gateways", {
   registrationToken: text("registration_token").notNull(),
 });
 
+export const channelState = sqliteTable("channel_state", {
+  singleton: integer("singleton").primaryKey(),
+  incarnation: integer("sequence").notNull(),
+});
+
 export const connectionShardCatalog = sqliteTable("connection_shard_catalog", {
   singleton: integer("singleton").primaryKey(),
   appId: text("app_id").notNull(),

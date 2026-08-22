@@ -65,6 +65,7 @@ const encodeAttachmentJson = Schema.encodeEffect(Schema.fromJsonString(Attachmen
 
 type SocketAttachment = Attachment;
 type SocketSubscription = SocketAttachment["subscriptions"][number];
+type DeliveryBarrier = Pick<Delivery, "incarnation" | "sequence">;
 
 const actorError = (operation: string, message: string): ActorError =>
   ActorError.make({ actor: "ConnectionShard", message, operation });
@@ -456,13 +457,24 @@ export const ConnectionShardLive = ConnectionShard.make(
         socket: Cloudflare.WebSocket,
         attachment: SocketAttachment,
         channel: string,
-        barrier: number,
+        barriers: ReadonlyArray<DeliveryBarrier>,
       ) {
         const key = pendingKey(attachment.socketId, channel);
         const events = takePending(key);
-        events.sort((left, right) => left.sequence - right.sequence);
+        let latestIncarnation = 0;
+        for (const barrier of barriers) {
+          latestIncarnation = Math.max(latestIncarnation, barrier.incarnation);
+        }
         for (const event of events) {
-          if (event.sequence <= barrier) {
+          if (event.incarnation < latestIncarnation) {
+            continue;
+          }
+          if (
+            barriers.some(
+              (barrier) =>
+                barrier.incarnation === event.incarnation && event.sequence <= barrier.sequence,
+            )
+          ) {
             continue;
           }
           yield* send(socket, {
@@ -479,25 +491,44 @@ export const ConnectionShardLive = ConnectionShard.make(
         attachment: SocketAttachment,
         channel: string,
         placement: ApplicationPlacement,
+        presenceStarted: boolean,
       ) {
+        const current = yield* decodeAttachment(socket, "rollbackSubscription");
+        const subscription = findSubscription(current, channel);
+        if (
+          presenceStarted &&
+          subscription?.kind === "presence" &&
+          subscription.userId !== undefined
+        ) {
+          const actor = yield* channelActor(placement, channel);
+          yield* actor.leavePresence(
+            yield* encodedPlacement(placement),
+            channel,
+            current.socketId,
+            subscription.userId,
+            subscription.state === "active",
+            current.shardName,
+          );
+        }
+        const latest = yield* decodeAttachment(socket, "rollbackSubscription");
         const rolledBack: SocketAttachment = {
-          ...attachment,
-          subscriptions: attachment.subscriptions.filter(
+          ...latest,
+          subscriptions: latest.subscriptions.filter(
             (subscription) => subscription.channel !== channel,
           ),
         };
         yield* saveAttachment(socket, rolledBack, "rollbackSubscription");
         removeChannelSocket(channel, attachment.socketId);
+        removeActiveChannelSocket(channel, attachment.socketId);
         const key = pendingKey(attachment.socketId, channel);
         joiningSubscriptions.delete(key);
         clearPending(key);
         if (!socketsByChannel.has(channel)) {
-          const subscription = findSubscription(attachment, channel);
           if (subscription !== undefined) {
             yield* unregisterChannel(
               placement,
               channel,
-              attachment.shardName,
+              current.shardName,
               subscription.registrationToken,
             ).pipe(Effect.result);
           }
@@ -619,7 +650,18 @@ export const ConnectionShardLive = ConnectionShard.make(
               : channelSnapshot(placement, channel)
           ).pipe(Effect.result);
           if (Result.isFailure(snapshotResult)) {
-            yield* rollbackSubscription(socket, joiningAttachment, channel, placement);
+            const rolledBack = yield* rollbackSubscription(
+              socket,
+              joiningAttachment,
+              channel,
+              placement,
+              false,
+            ).pipe(Effect.result);
+            if (Result.isFailure(rolledBack)) {
+              closingSockets.add(attachment.socketId);
+              yield* closeNative(socket, 1011, "Subscription failed", "subscribe");
+              return yield* rolledBack.failure;
+            }
             return yield* snapshotResult.failure;
           }
           return { attachment: joiningAttachment, snapshot: snapshotResult.success };
@@ -629,7 +671,10 @@ export const ConnectionShardLive = ConnectionShard.make(
         }
         const joiningAttachment = preparedResult.success.attachment;
         const snapshot = preparedResult.success.snapshot;
-        let barrier = snapshot.barrier;
+        const barriers: DeliveryBarrier[] = [
+          { incarnation: snapshot.incarnation, sequence: snapshot.barrier },
+        ];
+        const key = pendingKey(attachment.socketId, channel);
         let cachedEvent = snapshot.cache;
 
         let presenceMembers: ReadonlyArray<PresenceMember> | undefined;
@@ -640,6 +685,7 @@ export const ConnectionShardLive = ConnectionShard.make(
               yield* Schema.encodeEffect(PresenceJoin)({
                 appId: attachment.appId,
                 channel,
+                gatewayName: attachment.shardName,
                 jurisdiction: attachment.jurisdiction,
                 locationHint: attachment.locationHint,
                 socketId: attachment.socketId,
@@ -649,23 +695,45 @@ export const ConnectionShardLive = ConnectionShard.make(
             )
             .pipe(Effect.result);
           if (Result.isFailure(joinedResult)) {
-            yield* rollbackSubscription(socket, joiningAttachment, channel, placement);
+            const rolledBack = yield* rollbackSubscription(
+              socket,
+              joiningAttachment,
+              channel,
+              placement,
+              true,
+            ).pipe(Effect.result);
+            if (Result.isFailure(rolledBack)) {
+              closingSockets.add(attachment.socketId);
+              yield* closeNative(socket, 1011, "Subscription failed", "subscribe");
+              return yield* rolledBack.failure;
+            }
             return yield* joinedResult.failure;
           }
           const joined = joinedResult.success;
           presenceMembers = joined.members;
-          barrier = Math.max(barrier, joined.barrier);
+          barriers.push({ incarnation: joined.incarnation, sequence: joined.barrier });
           if (channelType.cache) {
             const latest = yield* channelSnapshot(placement, channel).pipe(Effect.result);
             if (Result.isFailure(latest)) {
-              const key = pendingKey(attachment.socketId, channel);
-              joiningSubscriptions.delete(key);
-              clearPending(key);
+              const rolledBack = yield* rollbackSubscription(
+                socket,
+                joiningAttachment,
+                channel,
+                placement,
+                true,
+              ).pipe(Effect.result);
+              closingSockets.add(attachment.socketId);
               yield* closeNative(socket, 1011, "Subscription failed", "subscribe");
+              if (Result.isFailure(rolledBack)) {
+                return yield* rolledBack.failure;
+              }
               return yield* latest.failure;
             }
             cachedEvent = latest.success.cache;
-            barrier = Math.max(barrier, latest.success.barrier);
+            barriers.push({
+              incarnation: latest.success.incarnation,
+              sequence: latest.success.barrier,
+            });
           }
         }
 
@@ -675,7 +743,6 @@ export const ConnectionShardLive = ConnectionShard.make(
             subscription.channel === channel ? { ...subscription, state: "active" } : subscription,
           ),
         };
-        const key = pendingKey(attachment.socketId, channel);
         const activated = yield* Effect.gen(function* () {
           yield* saveAttachment(socket, activeAttachment, "subscribe");
           if (cachedEvent !== null) {
@@ -703,7 +770,7 @@ export const ConnectionShardLive = ConnectionShard.make(
           }
           yield* Effect.gen(function* () {
             joiningSubscriptions.delete(key);
-            yield* flushPending(socket, activeAttachment, channel, barrier);
+            yield* flushPending(socket, activeAttachment, channel, barriers);
           }).pipe(Semaphore.withPermit(deliveryLock));
         }).pipe(
           Effect.ensuring(Effect.sync(() => joiningSubscriptions.delete(key))),
@@ -711,6 +778,13 @@ export const ConnectionShardLive = ConnectionShard.make(
         );
         if (Result.isFailure(activated)) {
           clearPending(key);
+          yield* rollbackSubscription(
+            socket,
+            activeAttachment,
+            channel,
+            placement,
+            presence !== undefined,
+          ).pipe(Effect.result);
           closingSockets.add(attachment.socketId);
           yield* closeNative(socket, 1011, "Subscription failed", "subscribe");
           return yield* activated.failure;
@@ -738,6 +812,8 @@ export const ConnectionShardLive = ConnectionShard.make(
               data.channel,
               attachment.socketId,
               userId,
+              current.state === "active",
+              attachment.shardName,
             );
           }).pipe(operationError("unsubscribe"), Effect.result);
           if (Result.isFailure(result)) {
@@ -756,15 +832,6 @@ export const ConnectionShardLive = ConnectionShard.make(
         const key = pendingKey(attachment.socketId, data.channel);
         joiningSubscriptions.delete(key);
         clearPending(key);
-        if (current.kind === "presence") {
-          const actor = yield* channelActor(placement, data.channel);
-          const settled = yield* actor
-            .settlePresence(yield* encodedPlacement(placement), data.channel, attachment.socketId)
-            .pipe(operationError("unsubscribe"), Effect.result);
-          if (Result.isFailure(settled)) {
-            failures.push(settled.failure);
-          }
-        }
         if (!socketsByChannel.has(data.channel)) {
           const result = yield* unregisterChannel(
             placement,
@@ -895,6 +962,8 @@ export const ConnectionShardLive = ConnectionShard.make(
                 subscription.channel,
                 attachment.socketId,
                 userId,
+                subscription.state === "active",
+                attachment.shardName,
               );
             }).pipe(operationError("cleanup"), Effect.result);
             if (Result.isFailure(result)) {
@@ -902,7 +971,6 @@ export const ConnectionShardLive = ConnectionShard.make(
             }
           }
         }
-
         socketsById.delete(attachment.socketId);
         messageLocks.delete(attachment.socketId);
         for (const subscription of attachment.subscriptions) {
@@ -911,19 +979,6 @@ export const ConnectionShardLive = ConnectionShard.make(
           const key = pendingKey(attachment.socketId, subscription.channel);
           joiningSubscriptions.delete(key);
           clearPending(key);
-          if (subscription.kind === "presence") {
-            const actor = yield* channelActor(placement, subscription.channel);
-            const settled = yield* actor
-              .settlePresence(
-                yield* encodedPlacement(placement),
-                subscription.channel,
-                attachment.socketId,
-              )
-              .pipe(operationError("cleanup"), Effect.result);
-            if (Result.isFailure(settled)) {
-              failures.push(settled.failure);
-            }
-          }
           if (!socketsByChannel.has(subscription.channel)) {
             const result = yield* unregisterChannel(
               placement,
@@ -1153,6 +1208,63 @@ export const ConnectionShardLive = ConnectionShard.make(
         yield* socket.close(code, reason);
       });
 
+      const activatePresence = Effect.fn("ConnectionShard.activatePresence")(function* (
+        channel: string,
+        socketId: string,
+      ) {
+        const socket = socketsById.get(socketId);
+        if (socket === undefined) {
+          return yield* failActor("activatePresence", "Presence socket does not exist");
+        }
+        const attachment = yield* decodeAttachment(socket, "activatePresence");
+        const subscription = findSubscription(attachment, channel);
+        if (subscription?.kind !== "presence") {
+          return yield* failActor("activatePresence", "Presence subscription does not exist");
+        }
+        if (subscription.state === "active") {
+          return;
+        }
+        const activeAttachment: SocketAttachment = {
+          ...attachment,
+          subscriptions: attachment.subscriptions.map((current) =>
+            current.channel === channel ? { ...current, state: "active" } : current,
+          ),
+        };
+        yield* saveAttachment(socket, activeAttachment, "activatePresence");
+        addActiveChannelSocket(channel, socketId);
+      }, rpcError("activatePresence"));
+
+      const deactivatePresence = Effect.fn("ConnectionShard.deactivatePresence")(function* (
+        channel: string,
+        socketId: string,
+      ) {
+        const socket = socketsById.get(socketId);
+        if (socket === undefined) {
+          return false;
+        }
+        const attachment = yield* decodeAttachment(socket, "deactivatePresence");
+        const subscription = findSubscription(attachment, channel);
+        if (subscription?.kind !== "presence") {
+          return false;
+        }
+        yield* saveAttachment(
+          socket,
+          {
+            ...attachment,
+            subscriptions: attachment.subscriptions.filter(
+              (current) => current.channel !== channel,
+            ),
+          },
+          "deactivatePresence",
+        );
+        removeChannelSocket(channel, socketId);
+        removeActiveChannelSocket(channel, socketId);
+        const key = pendingKey(socketId, channel);
+        joiningSubscriptions.delete(key);
+        clearPending(key);
+        return true;
+      }, rpcError("deactivatePresence"));
+
       const countSubscriptions = Effect.fn("ConnectionShard.count")(
         (channel: string) => Effect.succeed(activeSocketsByChannel.get(channel)?.size ?? 0),
         rpcError("count"),
@@ -1341,7 +1453,9 @@ export const ConnectionShardLive = ConnectionShard.make(
       }, rpcError("terminateApplication"));
 
       const api = {
+        activatePresence,
         count: countSubscriptions,
+        deactivatePresence,
         deliver,
         presence,
         terminateApplication,
