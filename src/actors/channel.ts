@@ -35,6 +35,8 @@ const CACHE_RETENTION_MS = 30 * 60_000;
 const COUNT_BROADCAST_INTERVAL_MS = 5_000;
 const COUNT_CHECKPOINT_KEY = "subscription-count-checkpoint";
 const COUNT_LARGE_CHANNEL_THRESHOLD = 100;
+const COUNT_SETTLE_DELAY_MS = 250;
+const COUNT_SETTLE_WINDOW_MS = 100;
 const IDENTITY_KEY = "channel-identity";
 
 const ChannelIdentity = Schema.Struct({
@@ -79,6 +81,7 @@ export const ChannelShardLive = ChannelShard.make(
         storedCheckpoint === undefined
           ? undefined
           : yield* Schema.decodeUnknownEffect(CountCheckpoint)(storedCheckpoint).pipe(Effect.orDie);
+      let countBurstStartedAt: number | undefined;
       const incarnation = yield* Effect.gen(function* () {
         const [previousState] = yield* db
           .select({ incarnation: channelState.incarnation })
@@ -625,12 +628,26 @@ export const ChannelShardLive = ChannelShard.make(
           Effect.gen(function* () {
             yield* ensureIdentity(placement, channel);
             const now = yield* Clock.currentTimeMillis;
-            const requestedAt =
-              countCheckpoint !== undefined && countCheckpoint.count > COUNT_LARGE_CHANNEL_THRESHOLD
-                ? Math.max(now, countCheckpoint.broadcastAt + COUNT_BROADCAST_INTERVAL_MS)
-                : now;
+            const checkpoint = countCheckpoint;
+            const largeChannel =
+              checkpoint !== undefined && checkpoint.count > COUNT_LARGE_CHANNEL_THRESHOLD;
             const scheduledAt = yield* state.storage.getAlarm();
-            if (scheduledAt === null || requestedAt < scheduledAt) {
+            if (!largeChannel && countBurstStartedAt === undefined) {
+              countBurstStartedAt =
+                scheduledAt === null ? now : scheduledAt - COUNT_BROADCAST_INTERVAL_MS;
+            }
+            const requestedAt =
+              checkpoint !== undefined && checkpoint.count > COUNT_LARGE_CHANNEL_THRESHOLD
+                ? Math.max(now, checkpoint.broadcastAt + COUNT_BROADCAST_INTERVAL_MS)
+                : Math.min(
+                    now + COUNT_SETTLE_DELAY_MS,
+                    (countBurstStartedAt ?? now) + COUNT_BROADCAST_INTERVAL_MS,
+                  );
+            if (
+              scheduledAt === null ||
+              requestedAt < scheduledAt ||
+              (!largeChannel && scheduledAt < now + COUNT_SETTLE_WINDOW_MS)
+            ) {
               yield* state.storage.setAlarm(requestedAt);
             }
           }).pipe(Semaphore.withPermit(countScheduleLock)),
@@ -648,6 +665,9 @@ export const ChannelShardLive = ChannelShard.make(
             yield* state.storage.setAlarm(deferredUntil);
             return;
           }
+          yield* Effect.sync(() => {
+            countBurstStartedAt = undefined;
+          }).pipe(Semaphore.withPermit(countScheduleLock));
 
           const identity = channelIdentity;
           if (identity === undefined) {
@@ -681,11 +701,8 @@ export const ChannelShardLive = ChannelShard.make(
             }
 
             const pendingAt = yield* state.storage.getAlarm();
-            if (pendingAt !== null) {
-              const nextAt =
-                subscriptionCount > COUNT_LARGE_CHANNEL_THRESHOLD
-                  ? broadcastAt + COUNT_BROADCAST_INTERVAL_MS
-                  : broadcastAt;
+            if (pendingAt !== null && subscriptionCount > COUNT_LARGE_CHANNEL_THRESHOLD) {
+              const nextAt = broadcastAt + COUNT_BROADCAST_INTERVAL_MS;
               if (pendingAt !== nextAt) {
                 yield* state.storage.setAlarm(nextAt);
               }
@@ -696,9 +713,13 @@ export const ChannelShardLive = ChannelShard.make(
           operationError("alarm"),
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
-              yield* state.storage.setAlarm(
-                (yield* Clock.currentTimeMillis) + COUNT_BROADCAST_INTERVAL_MS,
-              );
+              yield* Effect.gen(function* () {
+                const retryAt = (yield* Clock.currentTimeMillis) + COUNT_BROADCAST_INTERVAL_MS;
+                const pendingAt = yield* state.storage.getAlarm();
+                if (pendingAt === null || retryAt < pendingAt) {
+                  yield* state.storage.setAlarm(retryAt);
+                }
+              }).pipe(Semaphore.withPermit(countScheduleLock));
               yield* Effect.logWarning("Channel subscription-count alarm failed").pipe(
                 Effect.annotateLogs({
                   actor: "ChannelShard",
