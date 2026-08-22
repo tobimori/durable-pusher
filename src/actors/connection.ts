@@ -507,7 +507,6 @@ export const ConnectionShardLive = ConnectionShard.make(
             current.socketId,
             subscription.userId,
             subscription.state === "active",
-            current.shardName,
           );
         }
         const latest = yield* decodeAttachment(socket, "rollbackSubscription");
@@ -685,7 +684,6 @@ export const ConnectionShardLive = ConnectionShard.make(
               yield* Schema.encodeEffect(PresenceJoin)({
                 appId: attachment.appId,
                 channel,
-                gatewayName: attachment.shardName,
                 jurisdiction: attachment.jurisdiction,
                 locationHint: attachment.locationHint,
                 socketId: attachment.socketId,
@@ -813,7 +811,6 @@ export const ConnectionShardLive = ConnectionShard.make(
               attachment.socketId,
               userId,
               current.state === "active",
-              attachment.shardName,
             );
           }).pipe(operationError("unsubscribe"), Effect.result);
           if (Result.isFailure(result)) {
@@ -963,7 +960,6 @@ export const ConnectionShardLive = ConnectionShard.make(
                 attachment.socketId,
                 userId,
                 subscription.state === "active",
-                attachment.shardName,
               );
             }).pipe(operationError("cleanup"), Effect.result);
             if (Result.isFailure(result)) {
@@ -1208,63 +1204,6 @@ export const ConnectionShardLive = ConnectionShard.make(
         yield* socket.close(code, reason);
       });
 
-      const activatePresence = Effect.fn("ConnectionShard.activatePresence")(function* (
-        channel: string,
-        socketId: string,
-      ) {
-        const socket = socketsById.get(socketId);
-        if (socket === undefined) {
-          return yield* failActor("activatePresence", "Presence socket does not exist");
-        }
-        const attachment = yield* decodeAttachment(socket, "activatePresence");
-        const subscription = findSubscription(attachment, channel);
-        if (subscription?.kind !== "presence") {
-          return yield* failActor("activatePresence", "Presence subscription does not exist");
-        }
-        if (subscription.state === "active") {
-          return;
-        }
-        const activeAttachment: SocketAttachment = {
-          ...attachment,
-          subscriptions: attachment.subscriptions.map((current) =>
-            current.channel === channel ? { ...current, state: "active" } : current,
-          ),
-        };
-        yield* saveAttachment(socket, activeAttachment, "activatePresence");
-        addActiveChannelSocket(channel, socketId);
-      }, rpcError("activatePresence"));
-
-      const deactivatePresence = Effect.fn("ConnectionShard.deactivatePresence")(function* (
-        channel: string,
-        socketId: string,
-      ) {
-        const socket = socketsById.get(socketId);
-        if (socket === undefined) {
-          return false;
-        }
-        const attachment = yield* decodeAttachment(socket, "deactivatePresence");
-        const subscription = findSubscription(attachment, channel);
-        if (subscription?.kind !== "presence") {
-          return false;
-        }
-        yield* saveAttachment(
-          socket,
-          {
-            ...attachment,
-            subscriptions: attachment.subscriptions.filter(
-              (current) => current.channel !== channel,
-            ),
-          },
-          "deactivatePresence",
-        );
-        removeChannelSocket(channel, socketId);
-        removeActiveChannelSocket(channel, socketId);
-        const key = pendingKey(socketId, channel);
-        joiningSubscriptions.delete(key);
-        clearPending(key);
-        return true;
-      }, rpcError("deactivatePresence"));
-
       const countSubscriptions = Effect.fn("ConnectionShard.count")(
         (channel: string) => Effect.succeed(activeSocketsByChannel.get(channel)?.size ?? 0),
         rpcError("count"),
@@ -1453,9 +1392,7 @@ export const ConnectionShardLive = ConnectionShard.make(
       }, rpcError("terminateApplication"));
 
       const api = {
-        activatePresence,
         count: countSubscriptions,
-        deactivatePresence,
         deliver,
         presence,
         terminateApplication,

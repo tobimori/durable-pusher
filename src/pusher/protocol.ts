@@ -119,7 +119,6 @@ export const PresenceSnapshot = Schema.Struct({
 export const PresenceJoin = Schema.Struct({
   ...ApplicationPlacement.fields,
   channel: Schema.String,
-  gatewayName: Schema.String,
   socketId: Schema.String,
   userId: Schema.String,
   userInfo: Schema.Json,

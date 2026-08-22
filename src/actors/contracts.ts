@@ -27,9 +27,7 @@ import type {
 type ActorEffect<A> = Effect.Effect<A, ActorError, RuntimeContext>;
 
 export interface ConnectionShardApi {
-  readonly activatePresence: (channel: string, socketId: string) => ActorEffect<void>;
   readonly count: (channel: string) => ActorEffect<number>;
-  readonly deactivatePresence: (channel: string, socketId: string) => ActorEffect<boolean>;
   readonly deliver: (delivery: DeliveryEncoded) => ActorEffect<number>;
   readonly presence: (channel: string) => ActorEffect<ReadonlyArray<PresenceConnection>>;
   readonly terminateApplication: (appId: string) => ActorEffect<number>;
@@ -58,7 +56,6 @@ export interface ChannelShardApi {
     socketId: string,
     userId: string,
     active: boolean,
-    gatewayName: string,
   ) => ActorEffect<void>;
   readonly unregisterGateway: (
     placement: ApplicationPlacementEncoded,

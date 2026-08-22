@@ -487,17 +487,6 @@ export const ChannelShardLive = ChannelShard.make(
         };
         joiningPresence.set(decoded.socketId, connection);
         const presence = summarizePresence([...before.connections, connection]);
-        const activate = Effect.gen(function* () {
-          const gateway = yield* connections.getByName(decoded.gatewayName, placement);
-          yield* gateway.activatePresence(decoded.channel, decoded.socketId);
-        });
-        let activated = yield* activate.pipe(Effect.result);
-        if (Result.isFailure(activated)) {
-          activated = yield* activate.pipe(Effect.result);
-        }
-        if (Result.isSuccess(activated)) {
-          joiningPresence.delete(decoded.socketId);
-        }
         return {
           barrier: sequence,
           incarnation,
@@ -517,26 +506,11 @@ export const ChannelShardLive = ChannelShard.make(
         socketId: string,
         userId: string,
         active: boolean,
-        gatewayName: string,
       ) {
         const decoded = yield* Schema.decodeEffect(ApplicationPlacement)(placement);
         const wasJoining = joiningPresence.delete(socketId);
         leavingPresence.add(socketId);
-        let deactivated = false;
-        const deactivate = Effect.gen(function* () {
-          const gateway = yield* connections.getByName(gatewayName, decoded);
-          return yield* gateway.deactivatePresence(channel, socketId);
-        });
-        const first = yield* deactivate.pipe(Effect.result);
-        if (Result.isSuccess(first)) {
-          deactivated = first.success;
-        } else {
-          const second = yield* deactivate.pipe(Effect.result);
-          if (Result.isSuccess(second)) {
-            deactivated = second.success;
-          }
-        }
-        const wasPresent = wasJoining || active || deactivated;
+        const wasPresent = wasJoining || active;
         const presence = yield* queryPresence(decoded, channel);
         if (wasPresent && !presence.counts.has(userId)) {
           yield* publishUnlocked(
@@ -558,9 +532,8 @@ export const ChannelShardLive = ChannelShard.make(
           socketId: string,
           userId: string,
           active: boolean,
-          gatewayName: string,
         ) =>
-          leavePresenceUnlocked(placement, channel, socketId, userId, active, gatewayName).pipe(
+          leavePresenceUnlocked(placement, channel, socketId, userId, active).pipe(
             Semaphore.withPermit(publicationLock),
           ),
         operationError("leavePresence"),
