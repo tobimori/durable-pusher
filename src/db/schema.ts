@@ -25,6 +25,7 @@ export const connectionShardCatalog = sqliteTable("connection_shard_catalog", {
   locationHint: text("location_hint", {
     enum: ["afr", "apac", "apac-ne", "apac-se", "eeur", "enam", "me", "oc", "sam", "weur", "wnam"],
   }),
+  disabledGeneration: integer("disabled_generation").notNull().default(-1),
   shardCount: integer("shard_count").notNull(),
 });
 

@@ -146,6 +146,12 @@ PATCH  /control/v1/apps/{app_id}
 DELETE /control/v1/apps/{app_id}
 ```
 
+Application credentials, status, placement, and generation are authoritative in one Durable Object
+selected by the app key. The application list and app-ID/token indexes are projections; runtime
+authentication always checks the per-application authority. The directory stores token hashes but no
+application secrets or encryption keys. This layout requires a fresh deployment rather than an
+in-place migration from the registry-only schema.
+
 Application creation returns the generated secret, authorization token, and encryption key. The
 service returns these values only one time. Later reads return application data and the public
 application key.

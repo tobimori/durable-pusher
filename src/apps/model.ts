@@ -62,6 +62,11 @@ export const ApplicationSummary = Schema.Struct({
   updatedAt: Schema.Int,
 });
 
+export const ControlledApplication = Schema.Struct({
+  ...ApplicationSummary.fields,
+  generation: Schema.Int,
+});
+
 export const ApplicationPlacement = Schema.Struct({
   appId: AppId,
   jurisdiction: Schema.OptionFromNullOr(DurableObjectJurisdiction),
@@ -72,6 +77,16 @@ export const RuntimeApplication = Schema.Struct({
   ...ApplicationSummary.fields,
   appSecret: Schema.String,
   encryptionMasterKey: Schema.String,
+});
+
+export const ResolvedApplication = Schema.Struct({
+  ...RuntimeApplication.fields,
+  generation: Schema.Int,
+});
+
+export const ApplicationAuthorityState = Schema.Struct({
+  ...ResolvedApplication.fields,
+  authTokenHash: Schema.String,
 });
 
 export const ProvisionedApplication = Schema.Struct({
@@ -87,10 +102,16 @@ export type ApplicationBootstrap = typeof ApplicationBootstrap.Type;
 export type ApplicationBootstrapEncoded = typeof ApplicationBootstrap.Encoded;
 export type ApplicationSummary = typeof ApplicationSummary.Type;
 export type ApplicationSummaryEncoded = typeof ApplicationSummary.Encoded;
+export type ControlledApplication = typeof ControlledApplication.Type;
+export type ControlledApplicationEncoded = typeof ControlledApplication.Encoded;
 export type ApplicationPlacement = typeof ApplicationPlacement.Type;
 export type ApplicationPlacementEncoded = typeof ApplicationPlacement.Encoded;
 export type RuntimeApplication = typeof RuntimeApplication.Type;
 export type RuntimeApplicationEncoded = typeof RuntimeApplication.Encoded;
+export type ResolvedApplication = typeof ResolvedApplication.Type;
+export type ResolvedApplicationEncoded = typeof ResolvedApplication.Encoded;
+export type ApplicationAuthorityState = typeof ApplicationAuthorityState.Type;
+export type ApplicationAuthorityStateEncoded = typeof ApplicationAuthorityState.Encoded;
 export type ProvisionedApplication = typeof ProvisionedApplication.Type;
 export type ProvisionedApplicationEncoded = typeof ProvisionedApplication.Encoded;
 export type DurableObjectJurisdiction = typeof DurableObjectJurisdiction.Type;

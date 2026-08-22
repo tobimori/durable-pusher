@@ -188,8 +188,31 @@ describe("application control API", () => {
       yield* waitForDisconnection(client);
       expect(client.connection.state).not.toBe("connected");
 
+      const reenableResponse = yield* request("PATCH", path, Option.some('{"enabled":true}'));
+      expect(reenableResponse.status).toBe(200);
+      const reenabled = yield* decodeApplicationSummary(reenableResponse.text);
+      expect(reenabled.status).toBe("active");
+      const reconnectedClient = yield* Effect.acquireRelease(
+        Effect.sync(
+          () =>
+            new PusherClient(created.appKey, {
+              cluster: "mt1",
+              disableStats: true,
+              enabledTransports: ["ws"],
+              forceTLS: useTLS,
+              wsHost: host,
+              wsPort: port,
+              wssPort: port,
+            }),
+        ),
+        (value) => Effect.sync(() => value.disconnect()),
+      );
+      const reconnected = yield* prepareConnectionEvent(reconnectedClient, "connected");
+      yield* reconnected;
+
       const deleteResponse = yield* request("DELETE", path);
       expect(deleteResponse.status).toBe(204);
+      yield* waitForDisconnection(reconnectedClient);
 
       const missingResponse = yield* request("GET", path);
       expect(missingResponse.status).toBe(404);

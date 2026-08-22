@@ -3,11 +3,14 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import type * as Effect from "effect/Effect";
 import type {
   ApplicationBootstrapEncoded,
+  ApplicationAuthorityStateEncoded,
   ApplicationCreateEncoded,
   ApplicationPatchEncoded,
   ApplicationPlacementEncoded,
   ApplicationSummaryEncoded,
+  ControlledApplicationEncoded,
   ProvisionedApplicationEncoded,
+  ResolvedApplicationEncoded,
   RuntimeApplicationEncoded,
 } from "../apps/model.ts";
 import type {
@@ -30,7 +33,7 @@ export interface ConnectionShardApi {
   readonly count: (channel: string) => ActorEffect<number>;
   readonly deliver: (delivery: DeliveryEncoded) => ActorEffect<number>;
   readonly presence: (channel: string) => ActorEffect<ReadonlyArray<PresenceConnection>>;
-  readonly terminateApplication: (appId: string) => ActorEffect<number>;
+  readonly terminateApplication: (appId: string, generation: number) => ActorEffect<number>;
   readonly terminateUser: (appId: string, userId: string) => ActorEffect<number>;
 }
 
@@ -85,7 +88,16 @@ export interface ChannelShardApi {
 export interface ConnectionShardCatalogApi {
   readonly expand: (
     placement: ApplicationPlacementEncoded,
+    generation: number,
     expectedShardCount: number,
+  ) => ActorEffect<number>;
+  readonly fence: (
+    placement: ApplicationPlacementEncoded,
+    generation: number,
+  ) => ActorEffect<number>;
+  readonly route: (
+    placement: ApplicationPlacementEncoded,
+    generation: number,
   ) => ActorEffect<number>;
   readonly shardCount: (placement: ApplicationPlacementEncoded) => ActorEffect<number>;
 }
@@ -110,6 +122,7 @@ export interface FanoutRelayApi {
   ) => ActorEffect<ReadonlyArray<PresenceConnection>>;
   readonly terminateApplication: (
     placement: ApplicationPlacementEncoded,
+    generation: number,
     gatewayNames: ReadonlyArray<string>,
     path: string,
   ) => ActorEffect<number>;
@@ -127,20 +140,29 @@ export interface ChannelDirectoryShardApi {
 }
 
 export interface AppRegistryApi {
-  readonly bootstrap: (
-    input: ApplicationBootstrapEncoded,
-  ) => ActorEffect<RuntimeApplicationEncoded>;
+  readonly bootstrap: (input: ApplicationBootstrapEncoded) => ActorEffect<void>;
+  readonly control: (appId: string) => ActorEffect<ControlledApplicationEncoded | null>;
   readonly create: (input: ApplicationCreateEncoded) => ActorEffect<ProvisionedApplicationEncoded>;
   readonly get: (appId: string) => ActorEffect<ApplicationSummaryEncoded | null>;
   readonly list: () => ActorEffect<ReadonlyArray<ApplicationSummaryEncoded>>;
-  readonly remove: (appId: string) => ActorEffect<boolean>;
+  readonly remove: (appId: string) => ActorEffect<number | null>;
   readonly resolveByAuthToken: (authToken: string) => ActorEffect<RuntimeApplicationEncoded | null>;
-  readonly resolveById: (appId: string) => ActorEffect<RuntimeApplicationEncoded | null>;
-  readonly resolveByKey: (appKey: string) => ActorEffect<RuntimeApplicationEncoded | null>;
   readonly update: (
     appId: string,
     patch: ApplicationPatchEncoded,
-  ) => ActorEffect<ApplicationSummaryEncoded>;
+  ) => ActorEffect<ControlledApplicationEncoded>;
+}
+
+export interface ApplicationAuthorityApi {
+  readonly authenticate: (authToken: string) => ActorEffect<ResolvedApplicationEncoded | null>;
+  readonly control: () => ActorEffect<ControlledApplicationEncoded | null>;
+  readonly get: () => ActorEffect<ApplicationSummaryEncoded | null>;
+  readonly initialize: (
+    state: ApplicationAuthorityStateEncoded,
+  ) => ActorEffect<ResolvedApplicationEncoded>;
+  readonly remove: () => ActorEffect<number | null>;
+  readonly resolve: () => ActorEffect<ResolvedApplicationEncoded | null>;
+  readonly update: (patch: ApplicationPatchEncoded) => ActorEffect<ControlledApplicationEncoded>;
 }
 
 export class ConnectionShard extends Cloudflare.DurableObject<
@@ -170,9 +192,15 @@ export class AppRegistry extends Cloudflare.DurableObject<AppRegistry, AppRegist
   "AppRegistry",
 ) {}
 
+export class ApplicationAuthority extends Cloudflare.DurableObject<
+  ApplicationAuthority,
+  ApplicationAuthorityApi
+>()("ApplicationAuthority") {}
+
 export class PusherWorker extends Cloudflare.Worker<
   PusherWorker,
   {},
+  | ApplicationAuthority
   | AppRegistry
   | ChannelDirectoryShard
   | ChannelShard

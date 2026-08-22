@@ -12,8 +12,9 @@
 
 ## Object layout
 
-One Cloudflare Worker receives all requests. It exports these six Durable Object classes:
+One Cloudflare Worker receives all requests. It exports these seven Durable Object classes:
 
+- `ApplicationAuthority`
 - `AppRegistry`
 - `ConnectionShardCatalog`
 - `ConnectionShard`
@@ -26,6 +27,7 @@ Cloudflare can put each object in a different location.
 ```mermaid
 flowchart TD
     Client[Pusher client] --> Worker[Ingress Worker]
+    Worker -->|Resolve by app key| Authority[ApplicationAuthority per app]
     Worker --> Catalog[ConnectionShardCatalog]
     Worker --> Connection[ConnectionShard]
     Catalog -->|Adds shards when current shards are full| Connection
@@ -40,14 +42,51 @@ flowchart TD
 The classes share one Worker script. They do not share execution, storage, placement, or request
 order.
 
+## Application authority
+
+`idFromName(app_key)` selects one `ApplicationAuthority`. This object stores the credentials,
+placement, status, and generation for one application. Its stored provisioning record distinguishes
+an initialized application from an empty Durable Object address. The object is the source of truth
+for that application.
+
+WebSocket and signed REST requests contain the app key. The Worker validates the key and addresses
+the corresponding authority directly. Applications therefore do not contend on one global object
+when they authenticate connections or REST requests.
+
+`AppRegistry` is a non-authoritative control directory. It reserves custom app IDs, provides the
+application list, and maps opaque authorization-token hashes to app keys. It does not store app
+secrets or encryption keys. Creation and bootstrap initialize the per-application authority before
+publishing the directory row. A token lookup always finishes at the authority before it returns
+runtime credentials. Control safety does not depend on a projection write: a failed update is logged
+while the authoritative generation still fences connections, so list results can temporarily lag.
+The Worker performs bootstrap at most once in each isolate instead of once for every request.
+
+The Worker passes an encoded application snapshot to the selected connection shard in its internal
+request. Thus, a new connection does not repeat the authority lookup. WebSocket attachments retain
+the required app key so a shard can refresh credentials directly after hibernation.
+
+Each authority increments a generation when control state changes. Disabling an application sends
+that exact generation to the connection-shard catalog and all current connection shards. The catalog
+persists the generation before termination, rejects stale routing and expansion, and allows a later
+active generation. Each connection shard also persists its fence and records the accepted generation
+in every WebSocket attachment. A shard rejects an in-flight or delayed connection with an older
+generation, including a request that resolved the application immediately before the disable
+operation. A delayed termination does not close sockets from a newer re-enabled generation.
+
 ## Automatic connection sharding
 
 The catalog initially contains one connection shard. The Worker checks a maximum of eight shards.
 A full shard rejects a new WebSocket before it accepts the socket. The
 `PUSHER_CONNECTION_SHARD_SOFT_LIMIT` value specifies when a shard is full.
 
-If all checked shards are full, the catalog doubles the shard range in one operation. The Worker
-then sends retries to the new range. The service does not move existing WebSockets.
+If all checked shards are full, the catalog adds one shard with a compare-and-set operation. The
+Worker then sends retries to the new shard. Concurrent expansion requests observe the same new
+range. The service does not move existing WebSockets.
+
+Each Worker isolate keeps a five-second connection-route cache. Concurrent cache misses for one
+application use one catalog request. A full response refreshes the cache before expansion. Thus,
+ordinary connections do not call the catalog, while each connection shard remains the authority for
+its own capacity.
 
 The soft limit is an operating target. It is not a connection limit for the complete application.
 The service adds named Durable Objects to increase capacity. If you decrease the target, existing
@@ -134,9 +173,15 @@ a persistent user index.
 ## Placement and scaling limits
 
 You cannot change application placement after application creation. The service uses this placement
-for each object lookup. One channel shard controls the order for one channel. Therefore, the request
-rate of one channel shard limits a busy channel. More ordering lanes can increase the publish rate,
-but they cannot keep one global event order.
+for realtime data-plane object lookups. Application authorities remain in the unrestricted control
+plane because an app-key request does not know the placement before it resolves the authority; this
+matches the former global registry's credential placement. One channel shard controls the order for
+one channel. Therefore, the request rate of one channel shard limits a busy channel. More ordering
+lanes can increase the publish rate, but they cannot keep one global event order.
+
+Each Worker isolate keeps an application snapshot for one second and coalesces concurrent cache
+misses. The application authority remains the source of truth. Generation fences in the catalog and
+connection shards reject a cached snapshot after a completed disable operation.
 
 Cloudflare has these limits:
 

@@ -4,23 +4,30 @@ import { asc, eq, ne } from "drizzle-orm";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import {
   ApplicationBootstrap,
+  ApplicationAuthorityState,
   ApplicationCreate,
-  ApplicationPatch,
   ApplicationSummary,
+  ControlledApplication,
   ProvisionedApplication,
+  ResolvedApplication,
   RuntimeApplication,
   type ApplicationBootstrapEncoded,
+  type ApplicationAuthorityState as ApplicationAuthorityStateType,
   type ApplicationCreateEncoded,
   type ApplicationPatchEncoded,
+  type ResolvedApplicationEncoded,
 } from "../apps/model.ts";
 import registryMigrations from "../db/registry-migrations.ts";
 import { applications } from "../db/registry-schema.ts";
 import { sha256Hex } from "../pusher/crypto.ts";
 import { ActorError, mapActorError } from "../pusher/protocol.ts";
 import { AppRegistry } from "./contracts.ts";
+import { AppRegistryDependencies } from "./dependencies.ts";
 
 export { AppRegistry };
 
@@ -43,17 +50,12 @@ const toSummary = (row: ApplicationRow): ApplicationSummary => ({
   updatedAt: row.updatedAt,
 });
 
-const toRuntime = (row: ApplicationRow): RuntimeApplication => ({
-  ...toSummary(row),
-  appSecret: row.appSecret,
-  encryptionMasterKey: row.encryptionMasterKey,
-});
-
 const randomHex = Effect.fn("AppRegistry.randomHex")((byteLength: number) =>
   Effect.sync(() => bytesToHex(crypto.getRandomValues(new Uint8Array(byteLength)))),
 );
 
 const encodeApplicationSummary = Schema.encodeEffect(ApplicationSummary);
+const encodeApplicationAuthorityState = Schema.encodeEffect(ApplicationAuthorityState);
 const encodeProvisionedApplication = Schema.encodeEffect(ProvisionedApplication);
 const encodeRuntimeApplication = Schema.encodeEffect(RuntimeApplication);
 
@@ -63,9 +65,13 @@ const randomEncryptionKey = Effect.fn("AppRegistry.randomEncryptionKey")(functio
 });
 
 export const AppRegistryLive = AppRegistry.make(
-  Effect.succeed(
-    Effect.gen(function* () {
+  Effect.gen(function* () {
+    const { authorities } = yield* AppRegistryDependencies;
+    // Alchemy's Durable Object constructor is intentionally a two-phase Effect.
+    // @effect-diagnostics-next-line returnEffectInGen:off
+    return Effect.gen(function* () {
       const db = yield* Drizzle.DurableObject({ migrations: registryMigrations });
+      const registryLock = yield* Semaphore.make(1);
 
       const rowById = Effect.fn("AppRegistry.rowById")(function* (appId: string) {
         const [row] = yield* db
@@ -75,6 +81,41 @@ export const AppRegistryLive = AppRegistry.make(
           .limit(1);
         return Option.fromNullishOr(row);
       }, operationError("rowById"));
+
+      const initializeAuthority = Effect.fn("AppRegistry.initializeAuthority")(function* (
+        application: ApplicationAuthorityStateType,
+      ) {
+        return yield* authorities
+          .getByName(application.appKey)
+          .initialize(
+            yield* encodeApplicationAuthorityState(application).pipe(
+              Effect.mapError(() =>
+                actorError("initializeAuthority", "Application could not be encoded"),
+              ),
+            ),
+          );
+      }, operationError("initializeAuthority"));
+
+      const encodeRuntime = Effect.fn("AppRegistry.encodeRuntime")(function* (
+        encoded: ResolvedApplicationEncoded,
+        operation: string,
+      ) {
+        const application = yield* Schema.decodeEffect(ResolvedApplication)(encoded).pipe(
+          Effect.mapError(() => actorError(operation, "Application could not be decoded")),
+        );
+        return yield* encodeRuntimeApplication({
+          appId: application.appId,
+          appKey: application.appKey,
+          appSecret: application.appSecret,
+          createdAt: application.createdAt,
+          encryptionMasterKey: application.encryptionMasterKey,
+          jurisdiction: application.jurisdiction,
+          locationHint: application.locationHint,
+          name: application.name,
+          status: application.status,
+          updatedAt: application.updatedAt,
+        }).pipe(Effect.mapError(() => actorError(operation, "Application could not be encoded")));
+      });
 
       const create = Effect.fn("AppRegistry.create")(function* (input: ApplicationCreateEncoded) {
         const decoded = yield* Schema.decodeEffect(ApplicationCreate)(input).pipe(
@@ -89,19 +130,31 @@ export const AppRegistryLive = AppRegistry.make(
         const authToken = yield* randomHex(24);
         const encryptionMasterKey = yield* randomEncryptionKey();
         const now = yield* Clock.currentTimeMillis;
-        yield* db.insert(applications).values({
+        const row: ApplicationRow = {
           appId,
           appKey,
-          appSecret,
           authTokenHash: sha256Hex(authToken),
           createdAt: now,
-          encryptionMasterKey,
           jurisdiction: Option.getOrNull(decoded.jurisdiction),
           locationHint: Option.getOrNull(decoded.locationHint),
           name: decoded.name,
           status: "active",
           updatedAt: now,
-        });
+        };
+        const authorityState: ApplicationAuthorityStateType = {
+          ...toSummary(row),
+          appSecret,
+          authTokenHash: row.authTokenHash,
+          encryptionMasterKey,
+          generation: 0,
+        };
+        const authority = authorities.getByName(row.appKey);
+        yield* initializeAuthority(authorityState);
+        const inserted = yield* db.insert(applications).values(row).pipe(Effect.result);
+        if (Result.isFailure(inserted)) {
+          yield* authority.remove().pipe(Effect.result);
+          return yield* inserted.failure;
+        }
         const provisioned: ProvisionedApplication = {
           appId,
           appKey,
@@ -127,46 +180,78 @@ export const AppRegistryLive = AppRegistry.make(
           Effect.mapError(() => actorError("bootstrap", "Invalid bootstrap application")),
         );
         const existing = yield* rowById(decoded.appId);
-        if (Option.isSome(existing)) {
-          return yield* encodeRuntimeApplication(toRuntime(existing.value)).pipe(
-            Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
-          );
+        if (Option.isSome(existing) && existing.value.appKey !== decoded.appKey) {
+          return yield* actorError("bootstrap", "Bootstrap application identity does not match");
         }
         const now = yield* Clock.currentTimeMillis;
-        yield* db.insert(applications).values({
+        const row: ApplicationRow = Option.getOrElse(existing, () => ({
           appId: decoded.appId,
           appKey: decoded.appKey,
-          appSecret: decoded.appSecret,
           authTokenHash: sha256Hex(decoded.authToken),
           createdAt: now,
-          encryptionMasterKey: decoded.encryptionMasterKey,
           jurisdiction: Option.getOrNull(decoded.jurisdiction),
           locationHint: Option.getOrNull(decoded.locationHint),
           name: decoded.name,
           status: "active",
           updatedAt: now,
-        }).onConflictDoNothing();
-        const created = yield* rowById(decoded.appId);
-        if (Option.isNone(created)) {
-          return yield* actorError("bootstrap", "Bootstrap application was not persisted");
+        }));
+        const initialized = yield* initializeAuthority({
+          ...toSummary(row),
+          appSecret: decoded.appSecret,
+          authTokenHash: row.authTokenHash,
+          encryptionMasterKey: decoded.encryptionMasterKey,
+          generation: 0,
+        });
+        if (Option.isNone(existing)) {
+          const application = yield* Schema.decodeEffect(ResolvedApplication)(initialized).pipe(
+            Effect.mapError(() => actorError("bootstrap", "Application could not be decoded")),
+          );
+          const inserted = yield* db
+            .insert(applications)
+            .values({
+              appId: application.appId,
+              appKey: application.appKey,
+              authTokenHash: row.authTokenHash,
+              createdAt: application.createdAt,
+              jurisdiction: Option.getOrNull(application.jurisdiction),
+              locationHint: Option.getOrNull(application.locationHint),
+              name: application.name,
+              status: application.status,
+              updatedAt: application.updatedAt,
+            })
+            .pipe(Effect.result);
+          if (Result.isFailure(inserted)) {
+            return yield* inserted.failure;
+          }
         }
-        return yield* encodeRuntimeApplication(toRuntime(created.value)).pipe(
-          Effect.mapError(() => actorError("bootstrap", "Application could not be encoded")),
-        );
       }, operationError("bootstrap"));
 
       const get = Effect.fn("AppRegistry.get")(function* (appId: string) {
         const row = yield* rowById(appId);
-        const summary = Option.filter(row, (value) => value.status !== "deleted").pipe(
-          Option.map(toSummary),
-        );
-        if (Option.isNone(summary)) {
+        if (Option.isNone(row)) {
           return null;
         }
-        return yield* encodeApplicationSummary(summary.value).pipe(
-          Effect.mapError(() => actorError("get", "Application could not be encoded")),
-        );
+        const application = yield* authorities.getByName(row.value.appKey).get();
+        if (application === null && row.value.status !== "deleted") {
+          yield* db
+            .update(applications)
+            .set({
+              status: "deleted",
+              updatedAt: yield* Clock.currentTimeMillis,
+            })
+            .where(eq(applications.appId, appId))
+            .pipe(Effect.result);
+        }
+        return application;
       });
+
+      const control = Effect.fn("AppRegistry.control")(function* (appId: string) {
+        const row = yield* rowById(appId);
+        if (Option.isNone(row)) {
+          return null;
+        }
+        return yield* authorities.getByName(row.value.appKey).control();
+      }, operationError("control"));
 
       const list = Effect.fn("AppRegistry.list")(function* () {
         const rows = yield* db
@@ -181,37 +266,6 @@ export const AppRegistryLive = AppRegistry.make(
         );
       }, operationError("list"));
 
-      const resolveById = Effect.fn("AppRegistry.resolveById")(function* (appId: string) {
-        const row = yield* rowById(appId);
-        const application = Option.filter(row, (value) => value.status === "active").pipe(
-          Option.map(toRuntime),
-        );
-        if (Option.isNone(application)) {
-          return null;
-        }
-        return yield* encodeRuntimeApplication(application.value).pipe(
-          Effect.mapError(() => actorError("resolveById", "Application could not be encoded")),
-        );
-      });
-
-      const resolveByKey = Effect.fn("AppRegistry.resolveByKey")(function* (appKey: string) {
-        const [row] = yield* db
-          .select()
-          .from(applications)
-          .where(eq(applications.appKey, appKey))
-          .limit(1);
-        const application = Option.fromNullishOr(row).pipe(
-          Option.filter((value) => value.status === "active"),
-          Option.map(toRuntime),
-        );
-        if (Option.isNone(application)) {
-          return null;
-        }
-        return yield* encodeRuntimeApplication(application.value).pipe(
-          Effect.mapError(() => actorError("resolveByKey", "Application could not be encoded")),
-        );
-      }, operationError("resolveByKey"));
-
       const resolveByAuthToken = Effect.fn("AppRegistry.resolveByAuthToken")(function* (
         authToken: string,
       ) {
@@ -220,82 +274,87 @@ export const AppRegistryLive = AppRegistry.make(
           .from(applications)
           .where(eq(applications.authTokenHash, sha256Hex(authToken)))
           .limit(1);
-        const application = Option.fromNullishOr(row).pipe(
-          Option.filter((value) => value.status === "active"),
-          Option.map(toRuntime),
-        );
+        const application = Option.fromNullishOr(row);
         if (Option.isNone(application)) {
           return null;
         }
-        return yield* encodeRuntimeApplication(application.value).pipe(
-          Effect.mapError(() =>
-            actorError("resolveByAuthToken", "Application could not be encoded"),
-          ),
+        const resolved = Option.fromNullishOr(
+          yield* authorities.getByName(application.value.appKey).authenticate(authToken),
         );
+        return Option.isNone(resolved)
+          ? null
+          : yield* encodeRuntime(resolved.value, "resolveByAuthToken");
       }, operationError("resolveByAuthToken"));
 
       const update = Effect.fn("AppRegistry.update")(function* (
         appId: string,
         patch: ApplicationPatchEncoded,
       ) {
-        const decoded = yield* Schema.decodeEffect(ApplicationPatch)(patch).pipe(
-          Effect.mapError(() => actorError("update", "Invalid application settings")),
-        );
         const current = yield* rowById(appId);
         if (Option.isNone(current) || current.value.status === "deleted") {
           return yield* actorError("update", "Application does not exist");
         }
-        const currentValue = current.value;
-        const updatedAt = yield* Clock.currentTimeMillis;
-        yield* db
+        const encoded = yield* authorities.getByName(current.value.appKey).update(patch);
+        const updated = yield* Schema.decodeEffect(ControlledApplication)(encoded).pipe(
+          Effect.mapError(() => actorError("update", "Application could not be decoded")),
+        );
+        const projected = yield* db
           .update(applications)
           .set({
-            name: Option.getOrElse(decoded.name, () => currentValue.name),
-            status: Option.match(decoded.enabled, {
-              onNone: () => currentValue.status,
-              onSome: (enabled) => (enabled ? "active" : "disabled"),
-            }),
-            updatedAt,
+            name: updated.name,
+            status: updated.status,
+            updatedAt: updated.updatedAt,
           })
-          .where(eq(applications.appId, appId));
-        const updated = yield* rowById(appId);
-        if (Option.isNone(updated)) {
-          return yield* actorError("update", "Application update was not persisted");
+          .where(eq(applications.appId, appId))
+          .pipe(Effect.result);
+        if (Result.isFailure(projected)) {
+          yield* Effect.logWarning("Application directory projection update failed").pipe(
+            Effect.annotateLogs({ appId, operation: "update" }),
+          );
         }
-        return yield* encodeApplicationSummary(toSummary(updated.value)).pipe(
-          Effect.mapError(() => actorError("update", "Application could not be encoded")),
-        );
+        return encoded;
       }, operationError("update"));
 
       const remove = Effect.fn("AppRegistry.remove")(function* (appId: string) {
         const current = yield* rowById(appId);
-        if (Option.isNone(current) || current.value.status === "deleted") {
-          return false;
+        if (Option.isNone(current)) {
+          return null;
+        }
+        const generation = yield* authorities.getByName(current.value.appKey).remove();
+        if (generation === null) {
+          return null;
         }
         const updatedAt = yield* Clock.currentTimeMillis;
-        yield* db
+        const projected = yield* db
           .update(applications)
           .set({
-            appSecret: "",
-            encryptionMasterKey: "",
             status: "deleted",
             updatedAt,
           })
-          .where(eq(applications.appId, appId));
-        return true;
+          .where(eq(applications.appId, appId))
+          .pipe(Effect.result);
+        if (Result.isFailure(projected)) {
+          yield* Effect.logWarning("Application directory projection update failed").pipe(
+            Effect.annotateLogs({ appId, operation: "remove" }),
+          );
+        }
+        return generation;
       }, operationError("remove"));
 
       return {
-        bootstrap,
-        create,
-        get,
-        list,
-        remove,
-        resolveByAuthToken,
-        resolveById,
-        resolveByKey,
-        update,
+        bootstrap: (input: ApplicationBootstrapEncoded) =>
+          bootstrap(input).pipe(Semaphore.withPermit(registryLock)),
+        control: (appId: string) => control(appId).pipe(Semaphore.withPermit(registryLock)),
+        create: (input: ApplicationCreateEncoded) =>
+          create(input).pipe(Semaphore.withPermit(registryLock)),
+        get: (appId: string) => get(appId).pipe(Semaphore.withPermit(registryLock)),
+        list: () => list().pipe(Semaphore.withPermit(registryLock)),
+        remove: (appId: string) => remove(appId).pipe(Semaphore.withPermit(registryLock)),
+        resolveByAuthToken: (authToken: string) =>
+          resolveByAuthToken(authToken).pipe(Semaphore.withPermit(registryLock)),
+        update: (appId: string, patch: ApplicationPatchEncoded) =>
+          update(appId, patch).pipe(Semaphore.withPermit(registryLock)),
       };
-    }),
-  ),
+    });
+  }),
 );

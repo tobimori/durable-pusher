@@ -1,12 +1,18 @@
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import type * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as UrlParams from "effect/unstable/http/UrlParams";
 import { HttpActorDependencies } from "../actors/dependencies.ts";
-import { ApplicationPlacement, RuntimeApplication } from "../apps/model.ts";
+import {
+  AppKey,
+  ApplicationPlacement,
+  ResolvedApplication,
+  RuntimeApplication,
+} from "../apps/model.ts";
 import {
   DIRECTORY_SHARD_COUNT,
   channelShardName,
@@ -201,11 +207,28 @@ const canonicalQuery = Effect.fn("PusherHttp.canonicalQuery")(function* (url: Pa
 export const makePusherHttp = Effect.gen(function* () {
   const {
     applications,
+    authorities,
     catalogs: connectionShardCatalogs,
     channels: channelShards,
     directories: directoryShards,
     relays: fanoutRelays,
   } = yield* HttpActorDependencies;
+
+  const resolveApplicationByKey = Effect.fn("PusherHttp.resolveApplicationByKey")(function* (
+    appKey: string,
+  ) {
+    const decodedKey = yield* Schema.decodeEffect(AppKey)(appKey).pipe(Effect.result);
+    if (Result.isFailure(decodedKey)) {
+      return Option.none<RuntimeApplication>();
+    }
+    const authority = authorities.getByName(decodedKey.success);
+    const encoded = Option.fromNullishOr(yield* authority.resolve().pipe(actorApiError));
+    return Option.isNone(encoded)
+      ? Option.none<RuntimeApplication>()
+      : Option.some(
+          yield* Schema.decodeEffect(ResolvedApplication)(encoded.value).pipe(actorApiError),
+        );
+  });
 
   const authenticateRestRequest = Effect.fn("PusherHttp.authenticateRestRequest")(function* (
     request: HttpServerRequest.HttpServerRequest,
@@ -226,15 +249,10 @@ export const makePusherHttp = Effect.gen(function* () {
       "Missing authentication signature",
     );
 
-    const encodedApplication = Option.fromNullishOr(
-      yield* applications.getByName("applications").resolveByKey(appKey).pipe(actorApiError),
-    );
-    if (Option.isNone(encodedApplication)) {
+    const application = yield* resolveApplicationByKey(appKey);
+    if (Option.isNone(application)) {
       return yield* apiError(401, "Missing or invalid authentication parameters");
     }
-    const application = yield* Schema.decodeEffect(RuntimeApplication)(
-      encodedApplication.value,
-    ).pipe(actorApiError);
     if (!Option.contains(version, "1.0")) {
       return yield* apiError(401, "Unsupported authentication version");
     }
@@ -258,10 +276,10 @@ export const makePusherHttp = Effect.gen(function* () {
     }
 
     const stringToSign = `${request.method}\n${url.pathname}\n${yield* canonicalQuery(url)}`;
-    if (!timingSafeEqual(signature, hmacSha256Hex(application.appSecret, stringToSign))) {
+    if (!timingSafeEqual(signature, hmacSha256Hex(application.value.appSecret, stringToSign))) {
       return yield* apiError(401, "Invalid authentication signature");
     }
-    return application;
+    return application.value;
   });
 
   const publishOne = Effect.fn("PusherHttp.publishOne")(function* (

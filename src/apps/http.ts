@@ -13,14 +13,17 @@ import {
   ApplicationPatch,
   ApplicationPlacement,
   ApplicationSummary,
+  ControlledApplication,
   type ApplicationPlacementEncoded,
   type ApplicationSummaryEncoded,
+  type ControlledApplicationEncoded,
 } from "./model.ts";
 
 type RegistryNamespace = Effect.Success<typeof AppRegistry>;
 type ParsedUrl = typeof Schema.URLFromString.Type;
 type ApplicationTerminator = (
   placement: ApplicationPlacementEncoded,
+  generation: number,
 ) => Effect.Effect<number, { readonly message: string }, RuntimeContext>;
 
 const decodeJsonValue = Schema.decodeEffect(Schema.fromJsonString(Schema.Json));
@@ -85,6 +88,7 @@ export const makeApplicationsHttp = (
 ) => {
   const terminate = Effect.fn("ApplicationsHttp.terminate")(function* (
     encoded: ApplicationSummaryEncoded,
+    generation: number,
   ) {
     const application = yield* Schema.decodeEffect(ApplicationSummary)(encoded).pipe(
       Effect.mapError(() => apiError(503, "Application settings could not be decoded")),
@@ -94,9 +98,28 @@ export const makeApplicationsHttp = (
       jurisdiction: application.jurisdiction,
       locationHint: application.locationHint,
     }).pipe(Effect.mapError(() => apiError(503, "Application placement could not be encoded")));
-    yield* terminateApplication(placement).pipe(
+    yield* terminateApplication(placement, generation).pipe(
       Effect.mapError(() => apiError(503, "Application connections could not be terminated")),
     );
+  });
+
+  const publicApplication = Effect.fn("ApplicationsHttp.publicApplication")(function* (
+    encoded: ControlledApplicationEncoded,
+  ) {
+    const controlled = yield* Schema.decodeEffect(ControlledApplication)(encoded).pipe(
+      Effect.mapError(() => apiError(503, "Application settings could not be decoded")),
+    );
+    const application = yield* Schema.encodeEffect(ApplicationSummary)({
+      appId: controlled.appId,
+      appKey: controlled.appKey,
+      createdAt: controlled.createdAt,
+      jurisdiction: controlled.jurisdiction,
+      locationHint: controlled.locationHint,
+      name: controlled.name,
+      status: controlled.status,
+      updatedAt: controlled.updatedAt,
+    }).pipe(Effect.mapError(() => apiError(503, "Application settings could not be encoded")));
+    return { application, generation: controlled.generation, status: controlled.status };
   });
 
   const authorize = Effect.fn("ApplicationsHttp.authorize")(function* (
@@ -160,7 +183,7 @@ export const makeApplicationsHttp = (
       const encoded = yield* Schema.encodeEffect(ApplicationPatch)(patch).pipe(
         Effect.mapError(() => apiError(400, "Application patch could not be encoded")),
       );
-      const application = yield* registry
+      const controlled = yield* registry
         .update(appId.value, encoded)
         .pipe(
           Effect.mapError((error) =>
@@ -169,28 +192,42 @@ export const makeApplicationsHttp = (
               : apiError(503, "Application registry is unavailable"),
           ),
         );
+      const { application, generation } = yield* publicApplication(controlled);
       if (Option.contains(patch.enabled, false)) {
-        yield* terminate(application);
+        yield* terminate(application, generation);
       }
       return yield* json(application);
     }
     if (request.method === "DELETE") {
-      const current = Option.fromNullishOr(
-        yield* registry.get(appId.value).pipe(registryUnavailable),
+      const encodedCurrent = Option.fromNullishOr(
+        yield* registry.control(appId.value).pipe(registryUnavailable),
       );
-      if (Option.isNone(current)) {
+      if (Option.isNone(encodedCurrent)) {
         return yield* apiError(404, "Application does not exist");
+      }
+      const current = yield* publicApplication(encodedCurrent.value);
+      if (current.status === "deleted") {
+        const removedGeneration = yield* registry.remove(appId.value).pipe(registryUnavailable);
+        if (removedGeneration === null) {
+          return yield* apiError(404, "Application does not exist");
+        }
+        yield* terminate(current.application, removedGeneration);
+        return HttpServerResponse.empty({ headers: RESPONSE_HEADERS, status: 204 });
       }
       const disablePatch = yield* Schema.encodeEffect(ApplicationPatch)({
         enabled: Option.some(false),
         name: Option.none(),
       }).pipe(Effect.mapError(() => apiError(503, "Application patch could not be encoded")));
-      const disabled = yield* registry.update(appId.value, disablePatch).pipe(registryUnavailable);
-      yield* terminate(disabled);
-      const removed = yield* registry.remove(appId.value).pipe(registryUnavailable);
-      if (!removed) {
+      const controlled = yield* registry
+        .update(appId.value, disablePatch)
+        .pipe(registryUnavailable);
+      const disabled = yield* publicApplication(controlled);
+      yield* terminate(disabled.application, disabled.generation);
+      const removedGeneration = yield* registry.remove(appId.value).pipe(registryUnavailable);
+      if (removedGeneration === null) {
         return yield* apiError(404, "Application does not exist");
       }
+      yield* terminate(disabled.application, removedGeneration);
       return HttpServerResponse.empty({ headers: RESPONSE_HEADERS, status: 204 });
     }
     return yield* methodNotAllowed("DELETE, GET, PATCH");

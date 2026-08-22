@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { ApplicationPlacement } from "../apps/model.ts";
+import { AppKey, ApplicationPlacement } from "../apps/model.ts";
 
 export const CHANNEL_NAME_PATTERN = /^[A-Za-z0-9_\-=@,.;]{1,164}$/;
 export const SOCKET_ID_PATTERN = /^\d+\.\d+$/;
@@ -139,8 +139,10 @@ export const DirectoryEntry = Schema.Struct({
 
 export const Attachment = Schema.Struct({
   ...ApplicationPlacement.fields,
+  appKey: AppKey,
   eventCount: Schema.Int,
   eventWindow: Schema.Int,
+  generation: Schema.Int,
   protocol: Schema.Int,
   shardName: Schema.String,
   socketId: Schema.String,

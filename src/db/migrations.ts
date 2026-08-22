@@ -44,5 +44,8 @@ export default {
       DELETE FROM channel_gateways;
       DELETE FROM directory_channels;
     `,
+    "0006_application_generation_fence": `
+      ALTER TABLE connection_shard_catalog ADD COLUMN disabled_generation INTEGER NOT NULL DEFAULT -1;
+    `,
   },
 };

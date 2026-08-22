@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import {
   AppRegistry,
+  ApplicationAuthority,
   ChannelDirectoryShard,
   ChannelShard,
   ConnectionShardCatalog,
@@ -11,6 +12,7 @@ import {
 import type { PlacedNamespace } from "./placement.ts";
 
 type AppRegistryNamespace = Effect.Success<typeof AppRegistry>;
+type ApplicationAuthorityNamespace = Effect.Success<typeof ApplicationAuthority>;
 type ChannelNamespace = Effect.Success<typeof ChannelShard>;
 type CatalogNamespace = Effect.Success<typeof ConnectionShardCatalog>;
 type ConnectionNamespace = Effect.Success<typeof ConnectionShard>;
@@ -34,11 +36,18 @@ export class ChannelActorDependencies extends Context.Service<
 export class ConnectionActorDependencies extends Context.Service<
   ConnectionActorDependencies,
   {
-    readonly applications: AppRegistryNamespace;
+    readonly authorities: ApplicationAuthorityNamespace;
     readonly channels: PlacedNamespace<ChannelStub>;
     readonly connectionShardSoftLimit: number;
   }
 >()("durable-pusher/actors/ConnectionActorDependencies") {}
+
+export class AppRegistryDependencies extends Context.Service<
+  AppRegistryDependencies,
+  {
+    readonly authorities: ApplicationAuthorityNamespace;
+  }
+>()("durable-pusher/actors/AppRegistryDependencies") {}
 
 export class FanoutRelayDependencies extends Context.Service<
   FanoutRelayDependencies,
@@ -52,6 +61,7 @@ export class HttpActorDependencies extends Context.Service<
   HttpActorDependencies,
   {
     readonly applications: AppRegistryNamespace;
+    readonly authorities: ApplicationAuthorityNamespace;
     readonly catalogs: PlacedNamespace<CatalogStub>;
     readonly channels: PlacedNamespace<ChannelStub>;
     readonly directories: PlacedNamespace<DirectoryStub>;

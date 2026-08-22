@@ -156,6 +156,7 @@ export const FanoutRelayLive = FanoutRelay.make(
     const terminateApplication = Effect.fn("FanoutRelay.terminateApplication")(
       function* (
         encodedPlacement: ApplicationPlacementEncoded,
+        generation: number,
         gatewayNames: ReadonlyArray<string>,
         path: string,
       ) {
@@ -166,7 +167,7 @@ export const FanoutRelayLive = FanoutRelay.make(
             Effect.fn("FanoutRelay.terminateApplication.gateway")(function* (gatewayName) {
               return yield* Effect.gen(function* () {
                 const connection = yield* connections.getByName(gatewayName, placement);
-                return yield* connection.terminateApplication(placement.appId);
+                return yield* connection.terminateApplication(placement.appId, generation);
               }).pipe(Effect.result);
             }),
             { concurrency: RELAY_FANOUT_WIDTH },
@@ -189,7 +190,12 @@ export const FanoutRelayLive = FanoutRelay.make(
                 fanoutRelayName(placement.appId, "application-control", childPath),
                 placement,
               );
-              return yield* child.terminateApplication(encodedPlacement, group, childPath);
+              return yield* child.terminateApplication(
+                encodedPlacement,
+                generation,
+                group,
+                childPath,
+              );
             }).pipe(Effect.result);
           }),
           { concurrency: RELAY_FANOUT_WIDTH },

@@ -9,7 +9,12 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
-import { ApplicationPlacement, RuntimeApplication } from "../apps/model.ts";
+import {
+  AppKey,
+  ApplicationPlacement,
+  ResolvedApplication,
+  type ResolvedApplication as ResolvedApplicationType,
+} from "../apps/model.ts";
 import { verifyChannelAuthorization, verifyUserAuthentication } from "../pusher/crypto.ts";
 import {
   ActorError,
@@ -49,6 +54,7 @@ export { ConnectionShard };
 const CLIENT_EVENT_LIMIT = 10;
 const ACTIVITY_TIMEOUT_SECONDS = 120;
 const MAX_PENDING_EVENT_BYTES = 8 * 1_024 * 1_024;
+const DISABLED_GENERATION_KEY = "disabled-application-generation";
 
 const ConnectionPath = Schema.String.check(Schema.isPattern(/^\/app\/[^/]+$/));
 const ProtocolVersion = Schema.FiniteFromString.pipe(
@@ -57,9 +63,12 @@ const ProtocolVersion = Schema.FiniteFromString.pipe(
 
 const decodeUrl = Schema.decodeUnknownEffect(Schema.URLFromString);
 const decodeConnectionPath = Schema.decodeUnknownEffect(ConnectionPath);
-const decodeAppKey = Schema.decodeUnknownEffect(Schema.StringFromUriComponent);
+const decodeAppKeySegment = Schema.decodeUnknownEffect(Schema.StringFromUriComponent);
 const decodeProtocolVersion = Schema.decodeUnknownEffect(ProtocolVersion);
 const decodeAttachmentSchema = Schema.decodeUnknownEffect(Attachment);
+const decodeResolvedApplicationJson = Schema.decodeEffect(
+  Schema.fromJsonString(ResolvedApplication),
+);
 const encodeAttachmentSchema = Schema.encodeEffect(Attachment);
 const encodeAttachmentJson = Schema.encodeEffect(Schema.fromJsonString(Attachment));
 
@@ -95,7 +104,7 @@ export const ConnectionShardLive = ConnectionShard.make(
   Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
     const {
-      applications,
+      authorities,
       channels: channelShards,
       connectionShardSoftLimit,
     } = yield* ConnectionActorDependencies;
@@ -103,7 +112,6 @@ export const ConnectionShardLive = ConnectionShard.make(
     // Alchemy's Durable Object constructor is intentionally a two-phase Effect.
     // @effect-diagnostics-next-line returnEffectInGen:off
     return Effect.gen(function* () {
-      const registry = applications.getByName("applications");
       const socketsById = new Map<string, Cloudflare.WebSocket>();
       const socketsByChannel = new Map<string, Set<string>>();
       const activeSocketsByChannel = new Map<string, Set<string>>();
@@ -118,9 +126,17 @@ export const ConnectionShardLive = ConnectionShard.make(
       const pendingEventSizes = new Map<string, number>();
       let pendingEventBytes = 0;
       const deliveryLock = yield* Semaphore.make(1);
-      let cachedApplication: RuntimeApplication | undefined;
-      let disabledApplication = false;
-      let applicationGeneration = 0;
+      const applicationLock = yield* Semaphore.make(1);
+      let cachedApplication: ResolvedApplicationType | undefined;
+      const storedDisabledGeneration = Option.fromNullishOr(
+        yield* state.storage.get<unknown>(DISABLED_GENERATION_KEY),
+      );
+      let disabledGeneration = Option.isNone(storedDisabledGeneration)
+        ? -1
+        : yield* Schema.decodeUnknownEffect(Schema.Int)(storedDisabledGeneration.value).pipe(
+            operationError("restore"),
+            Effect.orDie,
+          );
 
       yield* state.setWebSocketAutoResponse(
         new WebSocketRequestResponsePair(
@@ -211,6 +227,10 @@ export const ConnectionShardLive = ConnectionShard.make(
       for (const socket of yield* state.getWebSockets()) {
         const attachment = yield* decodeAttachment(socket, "restore").pipe(Effect.result);
         if (Result.isSuccess(attachment)) {
+          if (attachment.success.generation <= disabledGeneration) {
+            yield* socket.close(4009, "Application disabled").pipe(Effect.orDie);
+            continue;
+          }
           const restored: SocketAttachment = {
             ...attachment.success,
             subscriptions: attachment.success.subscriptions.filter(
@@ -223,10 +243,10 @@ export const ConnectionShardLive = ConnectionShard.make(
       }
 
       const activeApplication = Effect.fn("ConnectionShard.activeApplication")(function* (
-        placement: ApplicationPlacement,
+        placement: SocketAttachment,
         operation: string,
       ) {
-        if (disabledApplication) {
+        if (placement.generation <= disabledGeneration) {
           return yield* failActor(operation, "Application is disabled or does not exist");
         }
         if (
@@ -237,11 +257,13 @@ export const ConnectionShardLive = ConnectionShard.make(
         ) {
           return cachedApplication;
         }
-        const encoded = Option.fromNullishOr(yield* registry.resolveById(placement.appId));
+        const encoded = Option.fromNullishOr(
+          yield* authorities.getByName(placement.appKey).resolve(),
+        );
         if (Option.isNone(encoded)) {
           return yield* failActor(operation, "Application is disabled or does not exist");
         }
-        const application = yield* Schema.decodeEffect(RuntimeApplication)(encoded.value).pipe(
+        const application = yield* Schema.decodeEffect(ResolvedApplication)(encoded.value).pipe(
           operationError(operation),
         );
         if (
@@ -1013,20 +1035,20 @@ export const ConnectionShardLive = ConnectionShard.make(
         socket: Cloudflare.WebSocket,
         protocol: number,
         shardName: string,
-        application: RuntimeApplication,
-        expectedGeneration: number,
+        application: ResolvedApplicationType,
       ) {
-        if (expectedGeneration !== applicationGeneration) {
+        if (application.generation <= disabledGeneration) {
           return yield* failActor("connect", "Application state changed during connection");
         }
-        disabledApplication = false;
         cachedApplication = application;
         const socketId = yield* makeSocketId();
         const now = yield* Clock.currentTimeMillis;
         const attachment: SocketAttachment = {
           appId: application.appId,
+          appKey: application.appKey,
           eventCount: 0,
           eventWindow: Math.floor(now / 1_000),
+          generation: application.generation,
           jurisdiction: application.jurisdiction,
           locationHint: application.locationHint,
           protocol,
@@ -1050,8 +1072,6 @@ export const ConnectionShardLive = ConnectionShard.make(
             status: 503,
           });
         }
-        const expectedGeneration = applicationGeneration;
-
         const [upgradeResponse, socket] = yield* Cloudflare.upgrade();
         const urlResult = yield* decodeUrl(request.originalUrl).pipe(Effect.result);
         if (Result.isFailure(urlResult)) {
@@ -1066,21 +1086,39 @@ export const ConnectionShardLive = ConnectionShard.make(
           Effect.result,
         );
         const keyResult = Result.isSuccess(pathResult)
-          ? yield* decodeAppKey(pathResult.success.slice(5)).pipe(Effect.result)
+          ? yield* Effect.gen(function* () {
+              const decoded = yield* decodeAppKeySegment(pathResult.success.slice(5));
+              return yield* Schema.decodeEffect(AppKey)(decoded);
+            }).pipe(Effect.result)
           : pathResult;
         const protocol = Option.flatMap(protocolResult, (result) =>
           Result.isSuccess(result) ? Option.some(result.success) : Option.none(),
         );
-        const encodedApplication = Result.isSuccess(keyResult)
-          ? Option.fromNullishOr(yield* registry.resolveByKey(keyResult.success))
-          : Option.none();
-        if (Option.isNone(encodedApplication)) {
+        const encodedApplication = Option.fromNullishOr(
+          request.headers["x-durable-pusher-application"],
+        );
+        if (Result.isFailure(keyResult) || Option.isNone(encodedApplication)) {
           yield* rejectConnection(socket, protocol, 4001, "Application does not exist");
           return upgradeResponse;
         }
-        const application = yield* Schema.decodeEffect(RuntimeApplication)(
-          encodedApplication.value,
-        ).pipe(operationError("fetch"));
+        const appKey = keyResult.success;
+        const applicationResult = yield* Effect.gen(function* () {
+          const bytes = yield* Schema.decodeEffect(Schema.Uint8ArrayFromBase64)(
+            encodedApplication.value,
+          );
+          const json = new TextDecoder().decode(bytes);
+          return yield* decodeResolvedApplicationJson(json);
+        }).pipe(Effect.result);
+        if (
+          Result.isFailure(applicationResult) ||
+          applicationResult.success.appKey !== appKey ||
+          applicationResult.success.status !== "active" ||
+          applicationResult.success.generation <= disabledGeneration
+        ) {
+          yield* rejectConnection(socket, protocol, 4001, "Application does not exist");
+          return upgradeResponse;
+        }
+        const application = applicationResult.success;
         if (Option.isNone(rawProtocol)) {
           yield* rejectConnection(socket, Option.none(), 4008, "Protocol version is required");
           return upgradeResponse;
@@ -1100,13 +1138,9 @@ export const ConnectionShardLive = ConnectionShard.make(
           return upgradeResponse;
         }
 
-        const connected = yield* connect(
-          socket,
-          protocol.value,
-          shardName.value,
-          application,
-          expectedGeneration,
-        ).pipe(Effect.result);
+        const connected = yield* connect(socket, protocol.value, shardName.value, application).pipe(
+          Effect.result,
+        );
         if (Result.isFailure(connected)) {
           yield* logNativeError("fetch", connected.failure);
           yield* sendNative(socket, pusherError(connected.failure.message), "fetch");
@@ -1235,6 +1269,11 @@ export const ConnectionShardLive = ConnectionShard.make(
           if (attachment.appId !== decoded.appId) {
             return yield* failActor("deliver", "Connection shard application mismatch");
           }
+          if (attachment.generation <= disabledGeneration) {
+            closingSockets.add(socketId);
+            yield* closeNative(socket, 4009, "Application disabled", "deliver");
+            continue;
+          }
           const subscription = findSubscription(attachment, decoded.channel);
           if (subscription === undefined || attachment.socketId === decoded.excludedSocketId) {
             continue;
@@ -1349,10 +1388,13 @@ export const ConnectionShardLive = ConnectionShard.make(
 
       const terminateApplication = Effect.fn("ConnectionShard.terminateApplication")(function* (
         appId: string,
+        generation: number,
       ) {
-        applicationGeneration += 1;
-        disabledApplication = true;
-        cachedApplication = undefined;
+        disabledGeneration = Math.max(disabledGeneration, generation);
+        yield* state.storage.put(DISABLED_GENERATION_KEY, disabledGeneration);
+        if (cachedApplication !== undefined && cachedApplication.generation <= disabledGeneration) {
+          cachedApplication = undefined;
+        }
         let total = 0;
         const failures: ActorError[] = [];
         for (const socket of yield* state.getWebSockets()) {
@@ -1368,12 +1410,15 @@ export const ConnectionShardLive = ConnectionShard.make(
             } else {
               total += 1;
             }
-          } else if (attachment.success.appId === appId) {
+          } else if (
+            attachment.success.appId === appId &&
+            attachment.success.generation <= generation
+          ) {
             socketsById.set(attachment.success.socketId, socket);
             closingSockets.add(attachment.success.socketId);
             const closed = yield* Effect.gen(function* () {
               const current = yield* decodeAttachment(socket, "terminateApplication");
-              if (current.appId !== appId) {
+              if (current.appId !== appId || current.generation > generation) {
                 return 0;
               }
               yield* socket.close(4009, "Application disabled");
@@ -1401,12 +1446,13 @@ export const ConnectionShardLive = ConnectionShard.make(
         count: countSubscriptions,
         deliver,
         presence,
-        terminateApplication,
+        terminateApplication: (appId: string, generation: number) =>
+          terminateApplication(appId, generation).pipe(Semaphore.withPermit(applicationLock)),
         terminateUser,
       } satisfies ConnectionShardApi;
       return {
         ...api,
-        fetch: fetch(),
+        fetch: fetch().pipe(Semaphore.withPermit(applicationLock)),
         webSocketClose,
         webSocketMessage,
       };
