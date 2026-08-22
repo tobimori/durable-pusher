@@ -130,13 +130,6 @@ export interface ChannelDirectoryShardApi {
   readonly list: (prefix: string | null) => ActorEffect<ReadonlyArray<DirectoryEntry>>;
 }
 
-export interface UserShardApi {
-  readonly terminate: (
-    placement: ApplicationPlacementEncoded,
-    userId: string,
-  ) => ActorEffect<number>;
-}
-
 export interface AppRegistryApi {
   readonly bootstrap: (
     input: ApplicationBootstrapEncoded,
@@ -177,8 +170,6 @@ export class ChannelDirectoryShard extends Cloudflare.DurableObject<
   ChannelDirectoryShardApi
 >()("ChannelDirectoryShard") {}
 
-export class UserShard extends Cloudflare.DurableObject<UserShard, UserShardApi>()("UserShard") {}
-
 export class AppRegistry extends Cloudflare.DurableObject<AppRegistry, AppRegistryApi>()(
   "AppRegistry",
 ) {}
@@ -192,5 +183,4 @@ export class PusherWorker extends Cloudflare.Worker<
   | ConnectionShardCatalog
   | ConnectionShard
   | FanoutRelay
-  | UserShard
 >()("DurablePusher") {}

@@ -12,7 +12,7 @@
 
 ## Object layout
 
-One Cloudflare Worker receives all requests. It exports these seven Durable Object classes:
+One Cloudflare Worker receives all requests. It exports these six Durable Object classes:
 
 - `AppRegistry`
 - `ConnectionShardCatalog`
@@ -20,7 +20,6 @@ One Cloudflare Worker receives all requests. It exports these seven Durable Obje
 - `ChannelShard`
 - `FanoutRelay`
 - `ChannelDirectoryShard`
-- `UserShard`
 
 Cloudflare can put each object in a different location.
 

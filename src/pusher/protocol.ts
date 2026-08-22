@@ -290,12 +290,6 @@ export const subscriptionSucceeded = (channel: string, data = "{}"): ServerEvent
   event: "pusher_internal:subscription_succeeded",
 });
 
-export const subscriptionCount = (channel: string, count: number): Effect.Effect<ServerEvent> =>
-  encodeJson({ subscription_count: count }).pipe(
-    Effect.map((data) => ({ channel, data, event: "pusher_internal:subscription_count" })),
-    Effect.orDie,
-  );
-
 export const pusherError = (message: string, code?: number): ServerEvent => ({
   data: code === undefined ? { message } : { code, message },
   event: "pusher:error",

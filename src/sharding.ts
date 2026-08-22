@@ -28,8 +28,6 @@ export const fanoutRelayName = (appId: string, channel: string, path: string): s
 export const directoryShardName = (appId: string, channel: string): string =>
   `${appId}:directory:${stableHash(channel) % DIRECTORY_SHARD_COUNT}`;
 
-export const userShardName = (appId: string, userId: string): string => `${appId}\0user\0${userId}`;
-
 export const makeSocketId = Effect.fn("Sharding.makeSocketId")(function* () {
   const now = yield* Clock.currentTimeMillis;
   const left = yield* Random.nextIntBetween(0, 2_147_483_647);

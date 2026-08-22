@@ -7,7 +7,13 @@ import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as UrlParams from "effect/unstable/http/UrlParams";
 import { HttpActorDependencies } from "../actors/dependencies.ts";
 import { ApplicationPlacement, RuntimeApplication } from "../apps/model.ts";
-import { DIRECTORY_SHARD_COUNT, channelShardName, userShardName } from "../sharding.ts";
+import {
+  DIRECTORY_SHARD_COUNT,
+  channelShardName,
+  connectionShardCatalogName,
+  connectionShardName,
+  fanoutRelayName,
+} from "../sharding.ts";
 import {
   channelAuthorization,
   encryptedChannelSharedSecret,
@@ -195,9 +201,10 @@ const canonicalQuery = Effect.fn("PusherHttp.canonicalQuery")(function* (url: Pa
 export const makePusherHttp = Effect.gen(function* () {
   const {
     applications,
+    catalogs: connectionShardCatalogs,
     channels: channelShards,
     directories: directoryShards,
-    users: userShards,
+    relays: fanoutRelays,
   } = yield* HttpActorDependencies;
 
   const authenticateRestRequest = Effect.fn("PusherHttp.authenticateRestRequest")(function* (
@@ -482,8 +489,24 @@ export const makePusherHttp = Effect.gen(function* () {
     const encodedPlacement =
       yield* Schema.encodeEffect(ApplicationPlacement)(placement).pipe(actorApiError);
     yield* Effect.gen(function* () {
-      const user = yield* userShards.getByName(userShardName(application.appId, userId), placement);
-      yield* user.terminate(encodedPlacement, userId);
+      const catalog = yield* connectionShardCatalogs.getByName(
+        connectionShardCatalogName(application.appId),
+        placement,
+      );
+      const shardCount = yield* catalog.shardCount(encodedPlacement);
+      const path = "terminate.root";
+      const relay = yield* fanoutRelays.getByName(
+        fanoutRelayName(application.appId, `#server-to-user-${userId}`, path),
+        placement,
+      );
+      yield* relay.terminateUser(
+        encodedPlacement,
+        userId,
+        Array.from({ length: shardCount }, (_, shard) =>
+          connectionShardName(application.appId, shard),
+        ),
+        path,
+      );
     }).pipe(actorApiError);
     return yield* json({});
   });

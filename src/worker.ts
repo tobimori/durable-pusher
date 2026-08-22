@@ -20,20 +20,17 @@ import {
   ConnectionShard,
   FanoutRelay,
   PusherWorker,
-  UserShard,
 } from "./actors/contracts.ts";
 import {
   ChannelActorDependencies,
   ConnectionActorDependencies,
   FanoutRelayDependencies,
   HttpActorDependencies,
-  UserActorDependencies,
 } from "./actors/dependencies.ts";
 import { ChannelDirectoryShardLive } from "./actors/directory.ts";
 import { FanoutRelayLive } from "./actors/relay.ts";
 import { makePlacedNamespace } from "./actors/placement.ts";
 import { AppRegistryLive } from "./actors/registry.ts";
-import { UserShardLive } from "./actors/user.ts";
 import {
   ApplicationBootstrap,
   ApplicationPlacement,
@@ -105,7 +102,6 @@ export const PusherWorkerLive = PusherWorker.make(
     const catalogs = yield* ConnectionShardCatalog.from(PusherWorker);
     const connections = yield* ConnectionShard.from(PusherWorker);
     const directories = yield* ChannelDirectoryShard.from(PusherWorker);
-    const users = yield* UserShard.from(PusherWorker);
     const relays = yield* FanoutRelay.from(PusherWorker);
     const placedChannels = makePlacedNamespace("ChannelShard", channels, environment);
     const placedConnections = makePlacedNamespace("ConnectionShard", connections, environment);
@@ -115,7 +111,6 @@ export const PusherWorkerLive = PusherWorker.make(
       directories,
       environment,
     );
-    const placedUsers = makePlacedNamespace("UserShard", users, environment);
     const placedRelays = makePlacedNamespace("FanoutRelay", relays, environment);
     const config = yield* AppConfig;
     if (config.connectionShardSoftLimit < 1) {
@@ -139,7 +134,6 @@ export const PusherWorkerLive = PusherWorker.make(
             applications,
             channels: placedChannels,
             connectionShardSoftLimit: config.connectionShardSoftLimit,
-            users: placedUsers,
           }),
         ),
       ),
@@ -148,14 +142,6 @@ export const PusherWorkerLive = PusherWorker.make(
         Layer.provide(
           Layer.succeed(FanoutRelayDependencies, {
             connections: placedConnections,
-            relays: placedRelays,
-          }),
-        ),
-      ),
-      UserShardLive.pipe(
-        Layer.provide(
-          Layer.succeed(UserActorDependencies, {
-            catalogs: placedCatalogs,
             relays: placedRelays,
           }),
         ),
@@ -169,15 +155,15 @@ export const PusherWorkerLive = PusherWorker.make(
         ConnectionShardCatalog,
         ConnectionShard,
         FanoutRelay,
-        UserShard,
       ],
       { concurrency: "unbounded", discard: true },
     ).pipe(Effect.provide(actorsLive));
     const httpDependencies = Layer.succeed(HttpActorDependencies, {
       applications,
+      catalogs: placedCatalogs,
       channels: placedChannels,
       directories: placedDirectories,
-      users: placedUsers,
+      relays: placedRelays,
     });
     const http = yield* makePusherHttp.pipe(Effect.provide(httpDependencies));
     const terminateApplication = Effect.fn("PusherWorker.terminateApplication")(function* (
